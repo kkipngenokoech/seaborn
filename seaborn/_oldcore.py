@@ -14,13 +14,13 @@ import matplotlib as mpl
 from ._decorators import (
     share_init_params_with_map,
 )
-from .external.version import Version
 from .palettes import (
     QUAL_PALETTES,
     color_palette,
 )
 from .utils import (
     _check_argument,
+    desaturate,
     get_color_cycle,
     remove_na,
 )
@@ -104,7 +104,7 @@ class HueMapping(SemanticMapping):
     cmap = None
 
     def __init__(
-        self, plotter, palette=None, order=None, norm=None,
+        self, plotter, palette=None, order=None, norm=None, saturation=1,
     ):
         """Map the levels of the `hue` variable to distinct colors.
 
@@ -160,6 +160,7 @@ class HueMapping(SemanticMapping):
                     list(data), palette, order,
                 )
 
+            self.saturation = saturation
             self.map_type = map_type
             self.lookup_table = lookup_table
             self.palette = palette
@@ -193,6 +194,10 @@ class HueMapping(SemanticMapping):
                 if np.ma.is_masked(normed):
                     normed = np.nan
                 value = self.cmap(normed)
+
+        if self.saturation < 1:
+            value = desaturate(value, self.saturation)
+
         return value
 
     def infer_map_type(self, palette, norm, input_format, var_type):
@@ -1116,14 +1121,14 @@ class VectorPlotter:
                 parts = []
                 grouped = self.plot_data[var].groupby(self.converters[var], sort=False)
                 for converter, orig in grouped:
-                    with pd.option_context('mode.use_inf_as_null', True):
+                    with pd.option_context('mode.use_inf_as_na', True):
                         orig = orig.dropna()
                         if var in self.var_levels:
                             # TODO this should happen in some centralized location
                             # it is similar to GH2419, but more complicated because
                             # supporting `order` in categorical plots is tricky
                             orig = orig[orig.isin(self.var_levels[var])]
-                    comp = pd.to_numeric(converter.convert_units(orig))
+                    comp = pd.to_numeric(converter.convert_units(orig)).astype(float)
                     if converter.get_scale() == "log":
                         comp = np.log10(comp)
                     parts.append(pd.Series(comp, orig.index, name=orig.name))
@@ -1282,10 +1287,7 @@ class VectorPlotter:
                     if scale is True:
                         set_scale("log")
                     else:
-                        if Version(mpl.__version__) >= Version("3.3"):
-                            set_scale("log", base=scale)
-                        else:
-                            set_scale("log", **{f"base{axis}": scale})
+                        set_scale("log", base=scale)
 
         # For categorical y, we want the "first" level to be at the top of the axis
         if self.var_types.get("y", None) == "categorical":
@@ -1417,15 +1419,15 @@ class VectorPlotter:
         if self.var_types[axis] == "numeric":
             self.plot_data = self.plot_data.sort_values(axis, kind="mergesort")
 
-        # Now get a reference to the categorical data vector
-        cat_data = self.plot_data[axis]
+        # Now get a reference to the categorical data vector and remove na values
+        cat_data = self.plot_data[axis].dropna()
 
         # Get the initial categorical order, which we do before string
         # conversion to respect the original types of the order list.
         # Track whether the order is given explicitly so that we can know
         # whether or not to use the order constructed here downstream
         self._var_ordered[axis] = order is not None or cat_data.dtype.name == "category"
-        order = pd.Index(categorical_order(cat_data, order))
+        order = pd.Index(categorical_order(cat_data, order), name=axis)
 
         # Then convert data to strings. This is because in matplotlib,
         # "categorical" data really mean "string" data, so doing this artists
@@ -1493,14 +1495,18 @@ def variable_type(vector, boolean_type="numeric"):
     var_type : 'numeric', 'categorical', or 'datetime'
         Name identifying the type of data in the vector.
     """
+    vector = pd.Series(vector)
 
     # If a categorical dtype is set, infer categorical
-    if pd.api.types.is_categorical_dtype(vector):
+    if isinstance(vector.dtype, pd.CategoricalDtype):
         return VariableType("categorical")
 
     # Special-case all-na data, which is always "numeric"
     if pd.isna(vector).all():
         return VariableType("numeric")
+
+    # At this point, drop nans to simplify further type inference
+    vector = vector.dropna()
 
     # Special-case binary/boolean data, allow caller to determine
     # This triggers a numpy warning when vector has strings/objects
@@ -1514,7 +1520,7 @@ def variable_type(vector, boolean_type="numeric"):
         warnings.simplefilter(
             action='ignore', category=(FutureWarning, DeprecationWarning)
         )
-        if np.isin(vector, [0, 1, np.nan]).all():
+        if np.isin(vector, [0, 1]).all():
             return VariableType(boolean_type)
 
     # Defer to positive pandas tests
@@ -1566,17 +1572,18 @@ def infer_orient(x=None, y=None, orient=None, require_numeric=True):
     x, y : Vector data or None
         Positional data vectors for the plot.
     orient : string or None
-        Specified orientation, which must start with "v" or "h" if not None.
+        Specified orientation. If not None, can be "x" or "y", or otherwise
+        must start with "v" or "h".
     require_numeric : bool
         If set, raise when the implied dependent variable is not numeric.
 
     Returns
     -------
-    orient : "v" or "h"
+    orient : "x" or "y"
 
     Raises
     ------
-    ValueError: When `orient` is not None and does not start with "h" or "v"
+    ValueError: When `orient` is an unknown string.
     TypeError: When dependent variable is not numeric, with `require_numeric`
 
     """
@@ -1592,24 +1599,24 @@ def infer_orient(x=None, y=None, orient=None, require_numeric=True):
             warnings.warn(single_var_warning.format("Horizontal", "y"))
         if require_numeric and y_type != "numeric":
             raise TypeError(nonnumeric_dv_error.format("Vertical", "y"))
-        return "v"
+        return "x"
 
     elif y is None:
         if str(orient).startswith("v"):
             warnings.warn(single_var_warning.format("Vertical", "x"))
         if require_numeric and x_type != "numeric":
             raise TypeError(nonnumeric_dv_error.format("Horizontal", "x"))
-        return "h"
+        return "y"
 
-    elif str(orient).startswith("v"):
+    elif str(orient).startswith("v") or orient == "x":
         if require_numeric and y_type != "numeric":
             raise TypeError(nonnumeric_dv_error.format("Vertical", "y"))
-        return "v"
+        return "x"
 
-    elif str(orient).startswith("h"):
+    elif str(orient).startswith("h") or orient == "y":
         if require_numeric and x_type != "numeric":
             raise TypeError(nonnumeric_dv_error.format("Horizontal", "x"))
-        return "h"
+        return "y"
 
     elif orient is not None:
         err = (
@@ -1619,20 +1626,20 @@ def infer_orient(x=None, y=None, orient=None, require_numeric=True):
         raise ValueError(err)
 
     elif x_type != "categorical" and y_type == "categorical":
-        return "h"
+        return "y"
 
     elif x_type != "numeric" and y_type == "numeric":
-        return "v"
+        return "x"
 
     elif x_type == "numeric" and y_type != "numeric":
-        return "h"
+        return "y"
 
     elif require_numeric and "numeric" not in (x_type, y_type):
         err = "Neither the `x` nor `y` variable appears to be numeric."
         raise TypeError(err)
 
     else:
-        return "v"
+        return "x"
 
 
 def unique_dashes(n):

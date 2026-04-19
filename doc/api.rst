@@ -44,6 +44,7 @@ Mark objects
     Lines
     Path
     Paths
+    Dash
     Range
 
 .. rubric:: Bar marks
@@ -66,6 +67,15 @@ Mark objects
     Area
     Band
 
+.. rubric:: Text marks
+
+.. autosummary::
+    :toctree: generated/
+    :template: object
+    :nosignatures:
+
+    Text
+
 Stat objects
 ~~~~~~~~~~~~
 
@@ -76,7 +86,10 @@ Stat objects
 
     Agg
     Est
+    Count
     Hist
+    KDE
+    Perc
     PolyFit
 
 Move objects
@@ -101,6 +114,7 @@ Scale objects
     :template: scale
     :nosignatures:
 
+    Boolean
     Continuous
     Nominal
     Temporal

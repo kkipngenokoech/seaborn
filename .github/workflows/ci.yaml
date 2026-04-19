@@ -5,11 +5,17 @@ on:
     branches: [master, v0.*]
   pull_request:
     branches: master
+  schedule:
+    - cron:  '0 6 * * 1,4' # Each Monday and Thursday at 06:00 UTC
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   NB_KERNEL: python
   MPLBACKEND: Agg
+  SEABORN_DATA: ${{ github.workspace }}/seaborn-data
 
 jobs:
   build-docs:
@@ -17,10 +23,10 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - name: Setup Python 3.10
-        uses: actions/setup-python@v3
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v4
         with:
-          python-version: "3.10"
+          python-version: "3.11"
 
       - name: Install seaborn
         run: |
@@ -31,10 +37,18 @@ jobs:
         run: |
           sudo apt-get install pandoc
 
-      - name: Build docs
+      - name: Cache datasets
         run: |
-          make -C doc -j `nproc` notebooks
-          make -C doc html
+          git clone https://github.com/mwaskom/seaborn-data.git
+          ls $SEABORN_DATA
+
+      - name: Build docs
+        env:
+          SPHINXOPTS: -j `nproc`
+        run: |
+          cd doc
+          make -j `nproc` notebooks
+          make html
 
 
   run-tests:
@@ -42,18 +56,15 @@ jobs:
 
     strategy:
       matrix:
-        python: ["3.7", "3.8", "3.9", "3.10"]
-        target: [test]
+        python: ["3.8", "3.9", "3.10", "3.11"]
         install: [full]
         deps: [latest]
 
         include:
-          - python: "3.7"
-            target: unittests
+          - python: "3.8"
             install: full
             deps: pinned
-          - python: "3.10"
-            target: unittests
+          - python: "3.11"
             install: light
             deps: latest
 
@@ -61,7 +72,7 @@ jobs:
       - uses: actions/checkout@v3
 
       - name: Setup Python ${{ matrix.python }}
-        uses: actions/setup-python@v3
+        uses: actions/setup-python@v4
         with:
           python-version: ${{ matrix.python }}
 
@@ -72,14 +83,11 @@ jobs:
           if [[ ${{matrix.deps }} == 'pinned' ]]; then DEPS='-r ci/deps_pinned.txt'; fi
           pip install .[dev$EXTRAS] $DEPS
 
-      - name: Cache datastes
-        run: python ci/cache_test_datasets.py
-
       - name: Run tests
-        run: make ${{ matrix.target }}
+        run: make test
 
       - name: Upload coverage
-        uses: codecov/codecov-action@v2
+        uses: codecov/codecov-action@v3
         if: ${{ success() }}
 
   lint:
@@ -89,10 +97,10 @@ jobs:
     steps:
 
       - name: Checkout
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
 
       - name: Setup Python
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v4
 
       - name: Install tools
         run: pip install mypy flake8

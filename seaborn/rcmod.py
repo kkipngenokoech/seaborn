@@ -504,7 +504,7 @@ def set_palette(palette, n_colors=None, desat=None, color_codes=False):
 
     Parameters
     ----------
-    palette : seaborn color paltte | matplotlib colormap | hls | husl
+    palette : seaborn color palette | matplotlib colormap | hls | husl
         Palette definition. Should be something :func:`color_palette` can process.
     n_colors : int
         Number of colors in the cycle. The default number of colors will depend
@@ -515,12 +515,6 @@ def set_palette(palette, n_colors=None, desat=None, color_codes=False):
     color_codes : bool
         If ``True`` and ``palette`` is a seaborn palette, remap the shorthand
         color codes (e.g. "b", "g", "r", etc.) to the colors from this palette.
-
-    Examples
-    --------
-    >>> set_palette("Reds")
-
-    >>> set_palette("Set1", 8, .75)
 
     See Also
     --------

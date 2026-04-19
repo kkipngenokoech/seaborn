@@ -1,6 +1,6 @@
 import numpy as np
 import matplotlib as mpl
-from seaborn.external.version import Version
+from seaborn.utils import _version_predates
 
 
 def MarkerStyle(marker=None, fillstyle=None):
@@ -76,7 +76,7 @@ def scale_factory(scale, axis, **kwargs):
 
     """
     modify_transform = False
-    if Version(mpl.__version__) < Version("3.4"):
+    if _version_predates(mpl, "3.4"):
         if axis[0] in "xy":
             modify_transform = True
             axis = axis[0]
@@ -107,7 +107,7 @@ def scale_factory(scale, axis, **kwargs):
 
 def set_scale_obj(ax, axis, scale):
     """Handle backwards compatability with setting matplotlib scale."""
-    if Version(mpl.__version__) < Version("3.4"):
+    if _version_predates(mpl, "3.4"):
         # The ability to pass a BaseScale instance to Axes.set_{}scale was added
         # to matplotlib in version 3.4.0: GH: matplotlib/matplotlib/pull/19089
         # Workaround: use the scale name, which is restrictive only if the user
@@ -149,16 +149,28 @@ def set_layout_engine(fig, engine):
     if hasattr(fig, "set_layout_engine"):
         fig.set_layout_engine(engine)
     else:
+        # _version_predates(mpl, 3.6)
         if engine == "tight":
             fig.set_tight_layout(True)
         elif engine == "constrained":
             fig.set_constrained_layout(True)
+        elif engine == "none":
+            fig.set_tight_layout(False)
+            fig.set_constrained_layout(False)
 
 
 def share_axis(ax0, ax1, which):
     """Handle changes to post-hoc axis sharing."""
-    if Version(mpl.__version__) < Version("3.5.0"):
+    if _version_predates(mpl, "3.5"):
         group = getattr(ax0, f"get_shared_{which}_axes")()
         group.join(ax1, ax0)
     else:
         getattr(ax1, f"share{which}")(ax0)
+
+
+def get_legend_handles(legend):
+    """Handle legendHandles attribute rename."""
+    if _version_predates(mpl, "3.7"):
+        return legend.legendHandles
+    else:
+        return legend.legend_handles

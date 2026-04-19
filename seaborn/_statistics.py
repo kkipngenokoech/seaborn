@@ -194,6 +194,8 @@ class KDE:
             return self._eval_bivariate(x1, x2, weights)
 
 
+# Note: we no longer use this for univariate histograms in histplot,
+# preferring _stats.Hist. We'll deprecate this once we have a bivariate Stat class.
 class Histogram:
     """Univariate and bivariate histogram estimator."""
     def __init__(
@@ -403,13 +405,13 @@ class ECDF:
 
         Parameters
         ----------
-        stat : {{"proportion", "count"}}
+        stat : {{"proportion", "percent", "count"}}
             Distribution statistic to compute.
         complementary : bool
             If True, use the complementary CDF (1 - CDF)
 
         """
-        _check_argument("stat", ["count", "proportion"], stat)
+        _check_argument("stat", ["count", "percent", "proportion"], stat)
         self.stat = stat
         self.complementary = complementary
 
@@ -424,8 +426,10 @@ class ECDF:
         weights = weights[sorter]
         y = weights.cumsum()
 
-        if self.stat == "proportion":
+        if self.stat in ["percent", "proportion"]:
             y = y / y.max()
+        if self.stat == "percent":
+            y = y * 100
 
         x = np.r_[-np.inf, x]
         y = np.r_[0, y]

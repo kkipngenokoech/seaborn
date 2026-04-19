@@ -1,4 +1,6 @@
 from itertools import product
+import warnings
+
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -7,7 +9,6 @@ from matplotlib.colors import same_color, to_rgba
 import pytest
 from numpy.testing import assert_array_equal, assert_array_almost_equal
 
-from seaborn.external.version import Version
 from seaborn.palettes import color_palette
 from seaborn._oldcore import categorical_order
 
@@ -21,7 +22,7 @@ from seaborn.relational import (
 )
 
 from seaborn.utils import _draw_figure
-from seaborn._compat import get_colormap
+from seaborn._compat import get_colormap, get_legend_handles
 from seaborn._testing import assert_plots_equal
 
 
@@ -94,7 +95,7 @@ class TestRelationalPlotter(Helpers):
         p.assign_variables(data=wide_df)
         assert p.input_format == "wide"
         assert list(p.variables) == ["x", "y", "hue", "style"]
-        assert len(p.plot_data) == np.product(wide_df.shape)
+        assert len(p.plot_data) == np.prod(wide_df.shape)
 
         x = p.plot_data["x"]
         expected_x = np.tile(wide_df.index, wide_df.shape[1])
@@ -126,7 +127,7 @@ class TestRelationalPlotter(Helpers):
 
         numeric_df = long_df.select_dtypes("number")
 
-        assert len(p.plot_data) == np.product(numeric_df.shape)
+        assert len(p.plot_data) == np.prod(numeric_df.shape)
 
         x = p.plot_data["x"]
         expected_x = np.tile(numeric_df.index, numeric_df.shape[1])
@@ -157,7 +158,7 @@ class TestRelationalPlotter(Helpers):
         p.assign_variables(data=wide_array)
         assert p.input_format == "wide"
         assert list(p.variables) == ["x", "y", "hue", "style"]
-        assert len(p.plot_data) == np.product(wide_array.shape)
+        assert len(p.plot_data) == np.prod(wide_array.shape)
 
         nrow, ncol = wide_array.shape
 
@@ -188,7 +189,7 @@ class TestRelationalPlotter(Helpers):
         p.assign_variables(data=flat_array)
         assert p.input_format == "wide"
         assert list(p.variables) == ["x", "y"]
-        assert len(p.plot_data) == np.product(flat_array.shape)
+        assert len(p.plot_data) == np.prod(flat_array.shape)
 
         x = p.plot_data["x"]
         expected_x = np.arange(flat_array.shape[0])
@@ -622,6 +623,23 @@ class TestRelationalPlotter(Helpers):
         for line, color in zip(lines, palette):
             assert line.get_color() == color
 
+    def test_relplot_unshared_axis_labels(self, long_df):
+
+        col, row = "a", "b"
+        g = relplot(
+            data=long_df, x="x", y="y", col=col, row=row,
+            facet_kws=dict(sharex=False, sharey=False),
+        )
+
+        for ax in g.axes[-1, :].flat:
+            assert ax.get_xlabel() == "x"
+        for ax in g.axes[:-1, :].flat:
+            assert ax.get_xlabel() == ""
+        for ax in g.axes[:, 0].flat:
+            assert ax.get_ylabel() == "y"
+        for ax in g.axes[:, 1:].flat:
+            assert ax.get_ylabel() == ""
+
     def test_relplot_data(self, long_df):
 
         g = relplot(
@@ -655,6 +673,17 @@ class TestRelationalPlotter(Helpers):
             g = relplot(data=long_df, x="x", y="y", ax=ax)
         assert len(ax.collections) == 0
         assert len(g.ax.collections) > 0
+
+    def test_legend_has_no_offset(self, long_df):
+
+        g = relplot(data=long_df, x="x", y="y", hue=long_df["z"] + 1e8)
+        for text in g.legend.texts:
+            assert float(text.get_text()) > 1e7
+
+    def test_lineplot_2d_dashes(self, long_df):
+        ax = lineplot(data=long_df[["x", "y"]], dashes=[(5, 5), (10, 10)])
+        for line in ax.get_lines():
+            assert line.is_dashed()
 
 
 class TestLinePlotter(SharedAxesLevelTests, Helpers):
@@ -1068,6 +1097,15 @@ class TestLinePlotter(SharedAxesLevelTests, Helpers):
         ax.clear()
         p.plot(ax, {})
 
+    def test_non_aggregated_data(self):
+
+        x = [1, 2, 3, 4]
+        y = [2, 4, 6, 8]
+        ax = lineplot(x=x, y=y)
+        line, = ax.lines
+        assert_array_equal(line.get_xdata(), x)
+        assert_array_equal(line.get_ydata(), y)
+
     def test_orient(self, long_df):
 
         long_df = long_df.drop("x", axis=1).rename(columns={"s": "y", "y": "x"})
@@ -1192,7 +1230,7 @@ class TestLinePlotter(SharedAxesLevelTests, Helpers):
         wide_df, wide_array,
         wide_list_of_series, wide_list_of_arrays, wide_list_of_lists,
         flat_array, flat_series, flat_list,
-        long_df, missing_df, object_df
+        long_df, null_df, object_df
     ):
 
         f, ax = plt.subplots()
@@ -1248,10 +1286,10 @@ class TestLinePlotter(SharedAxesLevelTests, Helpers):
         lineplot(x="x", y="y", hue="a", style="b", data=long_df)
         ax.clear()
 
-        lineplot(x="x", y="y", hue="a", style="a", data=missing_df)
+        lineplot(x="x", y="y", hue="a", style="a", data=null_df)
         ax.clear()
 
-        lineplot(x="x", y="y", hue="a", style="b", data=missing_df)
+        lineplot(x="x", y="y", hue="a", style="b", data=null_df)
         ax.clear()
 
         lineplot(x="x", y="y", hue="a", size="a", data=long_df)
@@ -1260,10 +1298,10 @@ class TestLinePlotter(SharedAxesLevelTests, Helpers):
         lineplot(x="x", y="y", hue="a", size="s", data=long_df)
         ax.clear()
 
-        lineplot(x="x", y="y", hue="a", size="a", data=missing_df)
+        lineplot(x="x", y="y", hue="a", size="a", data=null_df)
         ax.clear()
 
-        lineplot(x="x", y="y", hue="a", size="s", data=missing_df)
+        lineplot(x="x", y="y", hue="a", size="s", data=null_df)
         ax.clear()
 
         lineplot(x="x", y="y", hue="f", data=object_df)
@@ -1313,12 +1351,9 @@ class TestScatterPlotter(SharedAxesLevelTests, Helpers):
         self.func(data=long_df, x="x", y="y", facecolors="C6", ax=ax)
         assert self.get_last_color(ax) == to_rgba("C6")
 
-        if Version(mpl.__version__) >= Version("3.1.0"):
-            # https://github.com/matplotlib/matplotlib/pull/12851
-
-            ax = plt.figure().subplots()
-            self.func(data=long_df, x="x", y="y", fc="C4", ax=ax)
-            assert self.get_last_color(ax) == to_rgba("C4")
+        ax = plt.figure().subplots()
+        self.func(data=long_df, x="x", y="y", fc="C4", ax=ax)
+        assert self.get_last_color(ax) == to_rgba("C4")
 
     def test_legend_data(self, long_df):
 
@@ -1632,11 +1667,7 @@ class TestScatterPlotter(SharedAxesLevelTests, Helpers):
         norm = mpl.colors.Normalize()
         colors = cmap(norm(long_df["y"].to_numpy()))
 
-        keys = ["c", "facecolor", "facecolors"]
-
-        if Version(mpl.__version__) >= Version("3.1.0"):
-            # https://github.com/matplotlib/matplotlib/pull/12851
-            keys.append("fc")
+        keys = ["c", "fc", "facecolor", "facecolors"]
 
         for key in keys:
 
@@ -1713,7 +1744,7 @@ class TestScatterPlotter(SharedAxesLevelTests, Helpers):
         legend_data = [
             {
                 label.get_text(): handle.get_sizes().item()
-                for label, handle in zip(legend.get_texts(), legend.legendHandles)
+                for label, handle in zip(legend.get_texts(), get_legend_handles(legend))
             } for legend in legends
         ]
 
@@ -1735,9 +1766,9 @@ class TestScatterPlotter(SharedAxesLevelTests, Helpers):
 
     def test_unfilled_marker_edgecolor_warning(self, long_df):  # GH2636
 
-        with pytest.warns(None) as record:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
             scatterplot(data=long_df, x="x", y="y", marker="+")
-        assert not record
 
     def test_scatterplot_vs_relplot(self, long_df, long_semantics):
 
@@ -1756,7 +1787,7 @@ class TestScatterPlotter(SharedAxesLevelTests, Helpers):
         wide_df, wide_array,
         flat_series, flat_array, flat_list,
         wide_list_of_series, wide_list_of_arrays, wide_list_of_lists,
-        long_df, missing_df, object_df
+        long_df, null_df, object_df
     ):
 
         f, ax = plt.subplots()
@@ -1809,10 +1840,10 @@ class TestScatterPlotter(SharedAxesLevelTests, Helpers):
         scatterplot(x="x", y="y", hue="a", style="b", data=long_df)
         ax.clear()
 
-        scatterplot(x="x", y="y", hue="a", style="a", data=missing_df)
+        scatterplot(x="x", y="y", hue="a", style="a", data=null_df)
         ax.clear()
 
-        scatterplot(x="x", y="y", hue="a", style="b", data=missing_df)
+        scatterplot(x="x", y="y", hue="a", style="b", data=null_df)
         ax.clear()
 
         scatterplot(x="x", y="y", hue="a", size="a", data=long_df)
@@ -1821,10 +1852,10 @@ class TestScatterPlotter(SharedAxesLevelTests, Helpers):
         scatterplot(x="x", y="y", hue="a", size="s", data=long_df)
         ax.clear()
 
-        scatterplot(x="x", y="y", hue="a", size="a", data=missing_df)
+        scatterplot(x="x", y="y", hue="a", size="a", data=null_df)
         ax.clear()
 
-        scatterplot(x="x", y="y", hue="a", size="s", data=missing_df)
+        scatterplot(x="x", y="y", hue="a", size="s", data=null_df)
         ax.clear()
 
         scatterplot(x="x", y="y", hue="f", data=object_df)

@@ -6,7 +6,45 @@ import pytest
 from numpy.testing import assert_array_equal
 
 from seaborn._core.groupby import GroupBy
-from seaborn._stats.histogram import Hist
+from seaborn._stats.counting import Hist, Count
+
+
+class TestCount:
+
+    @pytest.fixture
+    def df(self, rng):
+
+        n = 30
+        return pd.DataFrame(dict(
+            x=rng.uniform(0, 7, n).round(),
+            y=rng.normal(size=n),
+            color=rng.choice(["a", "b", "c"], n),
+            group=rng.choice(["x", "y"], n),
+        ))
+
+    def get_groupby(self, df, orient):
+
+        other = {"x": "y", "y": "x"}[orient]
+        cols = [c for c in df if c != other]
+        return GroupBy(cols)
+
+    def test_single_grouper(self, df):
+
+        ori = "x"
+        df = df[["x"]]
+        gb = self.get_groupby(df, ori)
+        res = Count()(df, gb, ori, {})
+        expected = df.groupby("x").size()
+        assert_array_equal(res.sort_values("x")["y"], expected)
+
+    def test_multiple_groupers(self, df):
+
+        ori = "x"
+        df = df[["x", "group"]].sort_values("group")
+        gb = self.get_groupby(df, ori)
+        res = Count()(df, gb, ori, {})
+        expected = df.groupby(["x", "group"]).size()
+        assert_array_equal(res.sort_values(["x", "group"])["y"], expected)
 
 
 class TestHist:
@@ -122,6 +160,11 @@ class TestHist:
         out = h(long_df, *single_args)
         assert (out["y"] * out["space"]).sum() == len(long_df)
 
+    def test_invalid_stat(self):
+
+        with pytest.raises(ValueError, match="The `stat` parameter for `Hist`"):
+            Hist(stat="invalid")
+
     def test_cumulative_count(self, long_df, single_args):
 
         h = Hist(stat="count", cumulative=True)
@@ -157,8 +200,14 @@ class TestHist:
 
         h = Hist(stat="percent", common_norm=["a"])
         out = h(long_df, *triple_args)
-        for _, out_part in out.groupby(["a"]):
+        for _, out_part in out.groupby("a"):
             assert out_part["y"].sum() == pytest.approx(100)
+
+    def test_common_norm_warning(self, long_df, triple_args):
+
+        h = Hist(common_norm=["b"])
+        with pytest.warns(UserWarning, match=r"Undefined variable\(s\)"):
+            h(long_df, *triple_args)
 
     def test_common_bins_default(self, long_df, triple_args):
 
@@ -183,9 +232,15 @@ class TestHist:
         h = Hist(common_bins=False)
         out = h(long_df, *triple_args)
         bins = []
-        for _, out_part in out.groupby(["a"]):
+        for _, out_part in out.groupby("a"):
             bins.append(tuple(out_part["x"]))
         assert len(set(bins)) == out["a"].nunique()
+
+    def test_common_bins_warning(self, long_df, triple_args):
+
+        h = Hist(common_bins=["b"])
+        with pytest.warns(UserWarning, match=r"Undefined variable\(s\)"):
+            h(long_df, *triple_args)
 
     def test_histogram_single(self, long_df, single_args):
 

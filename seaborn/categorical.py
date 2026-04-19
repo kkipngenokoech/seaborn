@@ -1,3 +1,4 @@
+from collections import namedtuple
 from textwrap import dedent
 from numbers import Number
 import warnings
@@ -6,26 +7,31 @@ from functools import partial
 
 import numpy as np
 import pandas as pd
-try:
-    from scipy.stats import gaussian_kde
-    _no_scipy = False
-except ImportError:
-    from .external.kde import gaussian_kde
-    _no_scipy = True
 
 import matplotlib as mpl
 from matplotlib.collections import PatchCollection
 import matplotlib.patches as Patches
 import matplotlib.pyplot as plt
 
+from seaborn._core.typing import default, deprecated
 from seaborn._oldcore import (
     variable_type,
     infer_orient,
     categorical_order,
 )
+from seaborn._stats.density import KDE
 from seaborn.relational import _RelationalPlotter
 from seaborn import utils
-from seaborn.utils import remove_na, _normal_quantile_func, _draw_figure, _default_color
+from seaborn.utils import (
+    remove_na,
+    desaturate,
+    _check_argument,
+    _draw_figure,
+    _default_color,
+    _normal_quantile_func,
+    _normalize_kwargs,
+    _version_predates,
+)
 from seaborn._statistics import EstimateAggregator
 from seaborn.palettes import color_palette, husl_palette, light_palette, dark_palette
 from seaborn.axisgrid import FacetGrid, _facet_docs
@@ -45,9 +51,7 @@ class _CategoricalPlotterNew(_RelationalPlotter):
 
     semantics = "x", "y", "hue", "units"
 
-    wide_structure = {"x": "@columns", "y": "@values", "hue": "@columns"}
-
-    # flat_structure = {"x": "@values", "y": "@values"}
+    wide_structure = {"x": "@columns", "y": "@values"}
     flat_structure = {"y": "@values"}
 
     _legend_func = "scatter"
@@ -74,7 +78,7 @@ class _CategoricalPlotterNew(_RelationalPlotter):
         # For wide data, orient determines assignment to x/y differently from the
         # wide_structure rules in _core. If we do decide to make orient part of the
         # _core variable assignment, we'll want to figure out how to express that.
-        if self.input_format == "wide" and orient == "h":
+        if self.input_format == "wide" and orient in ["h", "y"]:
             self.plot_data = self.plot_data.rename(columns={"x": "y", "y": "x"})
             orig_variables = set(self.variables)
             orig_x = self.variables.pop("x", None)
@@ -109,14 +113,14 @@ class _CategoricalPlotterNew(_RelationalPlotter):
         # Categorical plots can be "univariate" in which case they get an anonymous
         # category label on the opposite axis. Note: this duplicates code in the core
         # scale_categorical function. We need to do it here because of the next line.
-        if self.cat_axis not in self.variables:
-            self.variables[self.cat_axis] = None
-            self.var_types[self.cat_axis] = "categorical"
-            self.plot_data[self.cat_axis] = ""
+        if self.orient not in self.variables:
+            self.variables[self.orient] = None
+            self.var_types[self.orient] = "categorical"
+            self.plot_data[self.orient] = ""
 
         # Categorical variables have discrete levels that we need to track
-        cat_levels = categorical_order(self.plot_data[self.cat_axis], order)
-        self.var_levels[self.cat_axis] = cat_levels
+        cat_levels = categorical_order(self.plot_data[self.orient], order)
+        self.var_levels[self.orient] = cat_levels
 
     def _hue_backcompat(self, color, palette, hue_order, force_hue=False):
         """Implement backwards compatibility for hue parametrization.
@@ -139,10 +143,10 @@ class _CategoricalPlotterNew(_RelationalPlotter):
         default_behavior = color is None or palette is not None
         if force_hue and "hue" not in self.variables and default_behavior:
             self._redundant_hue = True
-            self.plot_data["hue"] = self.plot_data[self.cat_axis]
-            self.variables["hue"] = self.variables[self.cat_axis]
+            self.plot_data["hue"] = self.plot_data[self.orient]
+            self.variables["hue"] = self.variables[self.orient]
             self.var_types["hue"] = "categorical"
-            hue_order = self.var_levels[self.cat_axis]
+            hue_order = self.var_levels[self.orient]
 
             # Because we convert the categorical axis variable to string,
             # we need to update a dictionary palette too
@@ -150,7 +154,11 @@ class _CategoricalPlotterNew(_RelationalPlotter):
                 palette = {str(k): v for k, v in palette.items()}
 
         else:
-            self._redundant_hue = False
+            if "hue" in self.variables:
+                redundant = (self.plot_data["hue"] == self.plot_data[self.orient]).all()
+            else:
+                redundant = False
+            self._redundant_hue = redundant
 
         # Previously, categorical plots had a trick where color= could seed the palette.
         # Because that's an explicit parameterization, we are going to give it one
@@ -160,37 +168,134 @@ class _CategoricalPlotterNew(_RelationalPlotter):
                 color = mpl.colors.to_hex(color)
             palette = f"dark:{color}"
             msg = (
-                "Setting a gradient palette using color= is deprecated and will be "
-                f"removed in version 0.13. Set `palette='{palette}'` for same effect."
+                "\n\nSetting a gradient palette using color= is deprecated and will be "
+                f"removed in v0.14.0. Set `palette='{palette}'` for the same effect.\n"
             )
-            warnings.warn(msg, FutureWarning)
+            warnings.warn(msg, FutureWarning, stacklevel=3)
 
         return palette, hue_order
 
     def _palette_without_hue_backcompat(self, palette, hue_order):
         """Provide one cycle where palette= implies hue= when not provided"""
         if "hue" not in self.variables and palette is not None:
-            msg = "Passing `palette` without assigning `hue` is deprecated."
+            msg = (
+                "\n\nPassing `palette` without assigning `hue` is deprecated "
+                f"and will be removed in v0.14.0. Assign the `{self.orient}` variable "
+                "to `hue` and set `legend=False` for the same effect.\n"
+            )
             warnings.warn(msg, FutureWarning, stacklevel=3)
+
             self.legend = False
-            self.plot_data["hue"] = self.plot_data[self.cat_axis]
-            self.variables["hue"] = self.variables.get(self.cat_axis)
-            self.var_types["hue"] = self.var_types.get(self.cat_axis)
-            hue_order = self.var_levels.get(self.cat_axis)
+            self.plot_data["hue"] = self.plot_data[self.orient]
+            self.variables["hue"] = self.variables.get(self.orient)
+            self.var_types["hue"] = self.var_types.get(self.orient)
+
+            hue_order = self.var_levels.get(self.orient)
+            self._var_levels.pop("hue", None)
+
         return hue_order
 
-    @property
-    def cat_axis(self):
-        return {"v": "x", "h": "y"}[self.orient]
+    def _point_kwargs_backcompat(self, scale, join, kwargs):
+        """Provide two cycles where scale= and join= work, but redirect to kwargs."""
+        if scale is not deprecated:
+            lw = mpl.rcParams["lines.linewidth"] * 1.8 * scale
+            mew = lw * .75
+            ms = lw * 2
+
+            msg = (
+                "\n\n"
+                "The `scale` parameter is deprecated and will be removed in v0.15.0. "
+                "You can now control the size of each plot element using matplotlib "
+                "`Line2D` parameters (e.g., `linewidth`, `markersize`, etc.)."
+                "\n"
+            )
+            warnings.warn(msg, stacklevel=3)
+            kwargs.update(linewidth=lw, markeredgewidth=mew, markersize=ms)
+
+        if join is not deprecated:
+            msg = (
+                "\n\n"
+                "The `join` parameter is deprecated and will be removed in v0.15.0."
+            )
+            if not join:
+                msg += (
+                    " You can remove the line between points with `linestyle='none'`."
+                )
+                kwargs.update(linestyle="")
+            msg += "\n"
+            warnings.warn(msg, stacklevel=3)
+
+    def _err_kws_backcompat(self, err_kws, errcolor, errwidth, capsize):
+        """Provide two cycles where existing signature-level err_kws are handled."""
+        def deprecate_err_param(name, key, val):
+            if val is deprecated:
+                return
+            suggest = f"err_kws={{'{key}': {val!r}}}"
+            msg = (
+                f"\n\nThe `{name}` parameter is deprecated. And will be removed "
+                f"in v0.15.0. Pass `{suggest}` instead.\n"
+            )
+            warnings.warn(msg, FutureWarning, stacklevel=4)
+            err_kws[key] = val
+
+        if errcolor is not None:
+            deprecate_err_param("errcolor", "color", errcolor)
+        deprecate_err_param("errwidth", "linewidth", errwidth)
+
+        if capsize is None:
+            capsize = 0
+            msg = (
+                "\n\nPassing `capsize=None` is deprecated and will be removed "
+                "in v0.15.0. Pass `capsize=0` to disable caps.\n"
+            )
+            warnings.warn(msg, FutureWarning, stacklevel=3)
+
+        return err_kws, capsize
+
+    def _scale_backcompat(self, scale, scale_hue, density_norm, common_norm):
+        """Provide two cycles of backcompat for scale kwargs"""
+        if scale is not deprecated:
+            density_norm = scale
+            msg = (
+                "\n\nThe `scale` parameter has been renamed and will be removed "
+                f"in v0.15.0. Pass `density_norm={scale!r}` for the same effect."
+            )
+            warnings.warn(msg, FutureWarning, stacklevel=3)
+
+        if scale_hue is not deprecated:
+            common_norm = scale_hue
+            msg = (
+                "\n\nThe `scale_hue` parameter has been replaced and will be removed "
+                f"in v0.15.0. Pass `common_norm={not scale_hue}` for the same effect."
+            )
+            warnings.warn(msg, FutureWarning, stacklevel=3)
+
+        return density_norm, common_norm
 
     def _get_gray(self, colors):
         """Get a grayscale value that looks good with color."""
         if not len(colors):
             return None
+        colors = [mpl.colors.to_rgb(c) for c in colors]
         unique_colors = np.unique(colors, axis=0)
         light_vals = [rgb_to_hls(*rgb[:3])[1] for rgb in unique_colors]
         lum = min(light_vals) * .6
         return (lum, lum, lum)
+
+    def _map_prop_with_hue(self, name, value, fallback, plot_kws):
+        """Support pointplot behavior of modifying the marker/linestyle with hue."""
+        if value is default:
+            value = plot_kws.pop(name, fallback)
+
+        if (levels := self._hue_map.levels) is None:
+            mapping = {None: value}
+        else:
+            if isinstance(value, list):
+                mapping = {k: v for k, v in zip(levels, value)}
+            else:
+                mapping = {k: value for k in levels}
+
+        return mapping
 
     def _adjust_cat_axis(self, ax, axis):
         """Set ticks and limits for a categorical variable."""
@@ -223,10 +328,59 @@ class _CategoricalPlotterNew(_RelationalPlotter):
             # Note limits that correspond to previously-inverted y axis
             ax.set_ylim(n - .5, -.5, auto=None)
 
+    def _dodge_needed(self):
+        """Return True when use of `hue` would cause overlaps."""
+        groupers = list({self.orient, "col", "row"} & set(self.variables))
+        if "hue" in self.variables:
+            orient = self.plot_data[groupers].value_counts()
+            paired = self.plot_data[[*groupers, "hue"]].value_counts()
+            return orient.size != paired.size
+        return False
+
+    def _dodge(self, keys, data):
+        """Apply a dodge transform to coordinates in place."""
+        hue_idx = self._hue_map.levels.index(keys["hue"])
+        n = len(self._hue_map.levels)
+        data["width"] /= n
+
+        full_width = data["width"] * n
+        offset = data["width"] * hue_idx + data["width"] / 2 - full_width / 2
+        data[self.orient] += offset
+
+    def _invert_scale(self, ax, data, vars=("x", "y")):
+        """Undo scaling after computation so data are plotted correctly."""
+        for var in vars:
+            _, inv = utils._get_transform_functions(ax, var[0])
+            if var == self.orient and "width" in data:
+                hw = data["width"] / 2
+                data["edge"] = inv(data[var] - hw)
+                data["width"] = inv(data[var] + hw) - data["edge"].to_numpy()
+            for suf in ["", "min", "max"]:
+                if (col := f"{var}{suf}") in data:
+                    data[col] = inv(data[col])
+
+    def _configure_legend(self, ax, func, common_kws=None, semantic_kws=None):
+
+        if self.legend == "auto":
+            show_legend = not self._redundant_hue and self.input_format != "wide"
+        else:
+            show_legend = bool(self.legend)
+
+        if show_legend:
+            self.add_legend_data(ax, func, common_kws, semantic_kws)
+            handles, _ = ax.get_legend_handles_labels()
+            if handles:
+                ax.legend(title=self.legend_title)
+
     @property
     def _native_width(self):
         """Return unit of width separating categories on native numeric scale."""
-        unique_values = np.unique(self.comp_data[self.cat_axis])
+        # Categorical data always have a unit width
+        if self.var_types[self.orient] == "categorical":
+            return 1
+
+        # Otherwise, define the width as the smallest space between observations
+        unique_values = np.unique(self.comp_data[self.orient])
         if len(unique_values) > 1:
             native_width = np.nanmin(np.diff(unique_values))
         else:
@@ -236,7 +390,7 @@ class _CategoricalPlotterNew(_RelationalPlotter):
     def _nested_offsets(self, width, dodge):
         """Return offsets for each hue level for dodged plots."""
         offsets = None
-        if "hue" in self.variables:
+        if "hue" in self.variables and self._hue_map.levels is not None:
             n_levels = len(self._hue_map.levels)
             if dodge:
                 each_width = width / n_levels
@@ -268,12 +422,12 @@ class _CategoricalPlotterNew(_RelationalPlotter):
             jlim = 0.1
         else:
             jlim = float(jitter)
-        if "hue" in self.variables and dodge:
+        if "hue" in self.variables and dodge and self._hue_map.levels is not None:
             jlim /= len(self._hue_map.levels)
         jlim *= self._native_width
         jitterer = partial(np.random.uniform, low=-jlim, high=+jlim)
 
-        iter_vars = [self.cat_axis]
+        iter_vars = [self.orient]
         if dodge:
             iter_vars.append("hue")
 
@@ -283,19 +437,18 @@ class _CategoricalPlotterNew(_RelationalPlotter):
         for sub_vars, sub_data in self.iter_data(iter_vars,
                                                  from_comp_data=True,
                                                  allow_empty=True):
+
+            ax = self._get_axes(sub_vars)
+
             if offsets is not None and (offsets != 0).any():
                 dodge_move = offsets[sub_data["hue"].map(self._hue_map.levels.index)]
 
             jitter_move = jitterer(size=len(sub_data)) if len(sub_data) > 1 else 0
 
-            adjusted_data = sub_data[self.cat_axis] + dodge_move + jitter_move
-            sub_data.loc[:, self.cat_axis] = adjusted_data
+            adjusted_data = sub_data[self.orient] + dodge_move + jitter_move
+            sub_data[self.orient] = adjusted_data
+            self._invert_scale(ax, sub_data)
 
-            for var in "xy":
-                if self._log_scaled(var):
-                    sub_data[var] = np.power(10, sub_data[var])
-
-            ax = self._get_axes(sub_vars)
             points = ax.scatter(sub_data["x"], sub_data["y"], color=color, **plot_kws)
 
             if "hue" in self.variables:
@@ -306,17 +459,7 @@ class _CategoricalPlotterNew(_RelationalPlotter):
             else:
                 points.set_edgecolors(edgecolor)
 
-        # Finalize the axes details
-        if self.legend == "auto":
-            show_legend = not self._redundant_hue and self.input_format != "wide"
-        else:
-            show_legend = bool(self.legend)
-
-        if show_legend:
-            self.add_legend_data(ax)
-            handles, _ = ax.get_legend_handles_labels()
-            if handles:
-                ax.legend(title=self.legend_title)
+        self._configure_legend(ax, ax.scatter)
 
     def plot_swarms(
         self,
@@ -330,7 +473,7 @@ class _CategoricalPlotterNew(_RelationalPlotter):
         width = .8 * self._native_width
         offsets = self._nested_offsets(width, dodge)
 
-        iter_vars = [self.cat_axis]
+        iter_vars = [self.orient]
         if dodge:
             iter_vars.append("hue")
 
@@ -342,17 +485,15 @@ class _CategoricalPlotterNew(_RelationalPlotter):
                                                  from_comp_data=True,
                                                  allow_empty=True):
 
+            ax = self._get_axes(sub_vars)
+
             if offsets is not None:
                 dodge_move = offsets[sub_data["hue"].map(self._hue_map.levels.index)]
 
             if not sub_data.empty:
-                sub_data.loc[:, self.cat_axis] = sub_data[self.cat_axis] + dodge_move
+                sub_data[self.orient] = sub_data[self.orient] + dodge_move
 
-            for var in "xy":
-                if self._log_scaled(var):
-                    sub_data[var] = np.power(10, sub_data[var])
-
-            ax = self._get_axes(sub_vars)
+            self._invert_scale(ax, sub_data)
             points = ax.scatter(sub_data["x"], sub_data["y"], color=color, **plot_kws)
 
             if "hue" in self.variables:
@@ -364,7 +505,7 @@ class _CategoricalPlotterNew(_RelationalPlotter):
                 points.set_edgecolors(edgecolor)
 
             if not sub_data.empty:
-                point_collections[(ax, sub_data[self.cat_axis].iloc[0])] = points
+                point_collections[(ax, sub_data[self.orient].iloc[0])] = points
 
         beeswarm = Beeswarm(
             width=width, orient=self.orient, warn_thresh=warn_thresh,
@@ -376,7 +517,7 @@ class _CategoricalPlotterNew(_RelationalPlotter):
 
                     beeswarm(points, center)
 
-                    if self.orient == "h":
+                    if self.orient == "y":
                         scalex = False
                         scaley = ax.get_autoscaley_on()
                     else:
@@ -387,7 +528,7 @@ class _CategoricalPlotterNew(_RelationalPlotter):
                     # set in _adjust_cat_axis, because that method currently leave
                     # the autoscale flag in its original setting. It may be better
                     # to disable autoscaling there to avoid needing to do this.
-                    fixed_scale = self.var_types[self.cat_axis] == "categorical"
+                    fixed_scale = self.var_types[self.orient] == "categorical"
                     ax.update_datalim(points.get_datalim(ax.transData))
                     if not fixed_scale and (scalex or scaley):
                         ax.autoscale_view(scalex=scalex, scaley=scaley)
@@ -397,23 +538,647 @@ class _CategoricalPlotterNew(_RelationalPlotter):
                 points.draw = draw.__get__(points)
 
         _draw_figure(ax.figure)
+        self._configure_legend(ax, ax.scatter)
 
-        # Finalize the axes details
-        if self.legend == "auto":
-            show_legend = not self._redundant_hue and self.input_format != "wide"
+    def plot_boxes(
+        self,
+        width,
+        dodge,
+        gap,
+        fill,
+        whis,
+        color,
+        linecolor,
+        linewidth,
+        fliersize,
+        plot_kws,  # TODO rename user_kws?
+    ):
+
+        iter_vars = ["hue"]
+        value_var = {"x": "y", "y": "x"}[self.orient]
+
+        if linecolor is None:
+            if "hue" in self.variables:
+                linecolor = self._get_gray(list(self._hue_map.lookup_table.values()))
+            else:
+                linecolor = self._get_gray([color])
+
+        def get_props(element, artist=mpl.lines.Line2D):
+            return _normalize_kwargs(plot_kws.pop(f"{element}props", {}), artist)
+
+        if not fill and linewidth is None:
+            linewidth = mpl.rcParams["lines.linewidth"]
+
+        plot_kws.setdefault("shownotches", plot_kws.pop("notch", False))
+
+        box_artist = mpl.patches.Rectangle if fill else mpl.lines.Line2D
+        props = {
+            "box": get_props("box", box_artist),
+            "median": get_props("median"),
+            "whisker": get_props("whisker"),
+            "flier": get_props("flier"),
+            "cap": get_props("cap"),
+        }
+
+        props["median"].setdefault("solid_capstyle", "butt")
+        props["whisker"].setdefault("solid_capstyle", "butt")
+        props["flier"].setdefault("markersize", fliersize)
+
+        ax = self.ax
+
+        for sub_vars, sub_data in self.iter_data(iter_vars,
+                                                 from_comp_data=True,
+                                                 allow_empty=False):
+
+            ax = self._get_axes(sub_vars)
+
+            grouped = sub_data.groupby(self.orient)[value_var]
+            value_data = [x.to_numpy() for _, x in grouped]
+            stats = pd.DataFrame(mpl.cbook.boxplot_stats(value_data, whis=whis))
+            positions = grouped.grouper.result_index.to_numpy(dtype=float)
+
+            orig_width = width * self._native_width
+            data = pd.DataFrame({self.orient: positions, "width": orig_width})
+            if dodge:
+                self._dodge(sub_vars, data)
+            if gap:
+                data["width"] *= 1 - gap
+            capwidth = plot_kws.get("capwidths", 0.5 * data["width"])
+
+            self._invert_scale(ax, data)
+
+            maincolor = self._hue_map(sub_vars["hue"]) if "hue" in sub_vars else color
+
+            # TODO how to handle solid / empty fliers?
+
+            if fill:
+                boxprops = {
+                    "facecolor": maincolor, "edgecolor": linecolor, **props["box"]
+                }
+                medianprops = {"color": linecolor, **props["median"]}
+                whiskerprops = {"color": linecolor, **props["whisker"]}
+                flierprops = {"markeredgecolor": linecolor, **props["flier"]}
+                capprops = {"color": linecolor, **props["cap"]}
+            else:
+                boxprops = {"color": maincolor, **props["box"]}
+                medianprops = {"color": maincolor, **props["median"]}
+                whiskerprops = {"color": maincolor, **props["whisker"]}
+                flierprops = {"markeredgecolor": maincolor, **props["flier"]}
+                capprops = {"color": maincolor, **props["cap"]}
+
+            if linewidth is not None:
+                for prop_dict in [boxprops, medianprops, whiskerprops, capprops]:
+                    prop_dict.setdefault("linewidth", linewidth)
+
+            default_kws = dict(
+                bxpstats=stats.to_dict("records"),
+                positions=data[self.orient],
+                # Set width to 0 with log scaled orient axis to avoid going < 0
+                widths=0 if self._log_scaled(self.orient) else data["width"],
+                patch_artist=fill,
+                vert=self.orient == "x",
+                manage_ticks=False,
+                boxprops=boxprops,
+                medianprops=medianprops,
+                whiskerprops=whiskerprops,
+                flierprops=flierprops,
+                capprops=capprops,
+                # Added in matplotlib 3.6.0; see below
+                # capwidths=capwidth,
+                **(
+                    {} if _version_predates(mpl, "3.6.0")
+                    else {"capwidths": capwidth}
+                )
+            )
+            boxplot_kws = {**default_kws, **plot_kws}
+            artists = ax.bxp(**boxplot_kws)
+
+            # Reset artist widths after adding so everything stays positive
+            ori_idx = ["x", "y"].index(self.orient)
+            if self._log_scaled(self.orient):
+                for i, box in enumerate(data.to_dict("records")):
+                    p0 = box["edge"]
+                    p1 = box["edge"] + box["width"]
+
+                    if artists["boxes"]:
+                        box_artist = artists["boxes"][i]
+                        if fill:
+                            box_verts = box_artist.get_path().vertices.T
+                        else:
+                            box_verts = box_artist.get_data()
+                        box_verts[ori_idx][0] = p0
+                        box_verts[ori_idx][3:] = p0
+                        box_verts[ori_idx][1:3] = p1
+                        if not fill:
+                            # When fill is True, the data get changed in place
+                            box_artist.set_data(box_verts)
+                        # TODO XXX don't update value dimension; don't shrink orient dim
+                        ax.update_datalim(np.transpose(box_verts))
+
+                    if artists["medians"]:
+                        verts = artists["medians"][i].get_xydata().T
+                        verts[ori_idx][:] = p0, p1
+                        artists["medians"][i].set_data(verts)
+
+                    if artists["caps"]:
+                        for line in artists["caps"][2 * i:2 * i + 2]:
+                            p0 = 10 ** (np.log10(box[self.orient]) - capwidth[i] / 2)
+                            p1 = 10 ** (np.log10(box[self.orient]) + capwidth[i] / 2)
+                            verts = line.get_xydata().T
+                            verts[ori_idx][:] = p0, p1
+                            line.set_data(verts)
+
+            ax.add_container(BoxPlotContainer(artists))
+
+        patch_kws = props["box"].copy()
+        if not fill:
+            patch_kws["facecolor"] = (1, 1, 1, 0)
         else:
-            show_legend = bool(self.legend)
+            patch_kws["edgecolor"] = linecolor
+        self._configure_legend(ax, ax.fill_between, patch_kws)
 
-        if show_legend:
-            self.add_legend_data(ax)
-            handles, _ = ax.get_legend_handles_labels()
-            if handles:
-                ax.legend(title=self.legend_title)
+    def plot_violins(
+        self,
+        width,
+        dodge,
+        gap,
+        split,
+        color,
+        fill,
+        linecolor,
+        linewidth,
+        inner,
+        density_norm,
+        common_norm,
+        kde_kws,
+        inner_kws,
+        plot_kws,
+    ):
+
+        iter_vars = [self.orient, "hue"]
+        value_var = {"x": "y", "y": "x"}[self.orient]
+
+        inner_options = ["box", "quart", "stick", "point", None]
+        _check_argument("inner", inner_options, inner, prefix=True)
+        _check_argument("density_norm", ["area", "count", "width"], density_norm)
+
+        if linecolor is None:
+            if "hue" in self.variables:
+                linecolor = self._get_gray(list(self._hue_map.lookup_table.values()))
+            else:
+                linecolor = self._get_gray([color])
+
+        if linewidth is None:
+            if fill:
+                linewidth = 1.25 * mpl.rcParams["patch.linewidth"]
+            else:
+                linewidth = mpl.rcParams["lines.linewidth"]
+
+        if inner is not None and inner.startswith("box"):
+            box_width = inner_kws.pop("box_width", linewidth * 4.5)
+            whis_width = inner_kws.pop("whis_width", box_width / 3)
+            marker = inner_kws.pop("marker", "_" if self.orient == "x" else "|")
+
+        kde = KDE(**kde_kws)
+        ax = self.ax
+        violin_data = []
+
+        # Iterate through all the data splits once to compute the KDEs
+        for sub_vars, sub_data in self.iter_data(iter_vars,
+                                                 from_comp_data=True,
+                                                 allow_empty=False):
+
+            sub_data["weight"] = sub_data.get("weights", 1)
+            stat_data = kde._transform(sub_data, value_var, [])
+
+            maincolor = self._hue_map(sub_vars["hue"]) if "hue" in sub_vars else color
+            if not fill:
+                linecolor = maincolor
+                maincolor = "none"
+            default_kws = dict(
+                facecolor=maincolor,
+                edgecolor=linecolor,
+                linewidth=linewidth,
+            )
+
+            violin_data.append({
+                "position": sub_vars[self.orient],
+                "observations": sub_data[value_var],
+                "density": stat_data["density"],
+                "support": stat_data[value_var],
+                "kwargs": {**default_kws, **plot_kws},
+                "sub_vars": sub_vars,
+                "ax": self._get_axes(sub_vars),
+            })
+
+        # Once we've computed all the KDEs, get statistics for normalization
+        def vars_to_key(sub_vars):
+            return tuple((k, v) for k, v in sub_vars.items() if k != self.orient)
+
+        norm_keys = [vars_to_key(violin["sub_vars"]) for violin in violin_data]
+        if common_norm:
+            common_max_density = np.nanmax([v["density"].max() for v in violin_data])
+            common_max_count = np.nanmax([len(v["observations"]) for v in violin_data])
+            max_density = {key: common_max_density for key in norm_keys}
+            max_count = {key: common_max_count for key in norm_keys}
+        else:
+            max_density = {
+                key: np.nanmax([
+                    v["density"].max() for v in violin_data
+                    if vars_to_key(v["sub_vars"]) == key
+                ]) for key in norm_keys
+            }
+            max_count = {
+                key: np.nanmax([
+                    len(v["observations"]) for v in violin_data
+                    if vars_to_key(v["sub_vars"]) == key
+                ]) for key in norm_keys
+            }
+
+        real_width = width * self._native_width
+
+        # Now iterate through the violins again to apply the normalization and plot
+        for violin in violin_data:
+
+            index = pd.RangeIndex(0, max(len(violin["support"]), 1))
+            data = pd.DataFrame({
+                self.orient: violin["position"],
+                value_var: violin["support"],
+                "density": violin["density"],
+                "width": real_width,
+            }, index=index)
+
+            if dodge:
+                self._dodge(violin["sub_vars"], data)
+            if gap:
+                data["width"] *= 1 - gap
+
+            # Normalize the density across the distribution(s) and relative to the width
+            norm_key = vars_to_key(violin["sub_vars"])
+            hw = data["width"] / 2
+            peak_density = violin["density"].max()
+            if np.isnan(peak_density):
+                span = 1
+            elif density_norm == "area":
+                span = data["density"] / max_density[norm_key]
+            elif density_norm == "count":
+                count = len(violin["observations"])
+                span = data["density"] / peak_density * (count / max_count[norm_key])
+            elif density_norm == "width":
+                span = data["density"] / peak_density
+            span = span * hw * (2 if split else 1)
+
+            # Handle split violins (i.e. asymmetric spans)
+            right_side = (
+                0 if "hue" not in self.variables
+                else self._hue_map.levels.index(violin["sub_vars"]["hue"]) % 2
+            )
+            if split:
+                offsets = (hw, span - hw) if right_side else (span - hw, hw)
+            else:
+                offsets = span, span
+
+            ax = violin["ax"]
+            _, invx = utils._get_transform_functions(ax, "x")
+            _, invy = utils._get_transform_functions(ax, "y")
+            inv_pos = {"x": invx, "y": invy}[self.orient]
+            inv_val = {"x": invx, "y": invy}[value_var]
+
+            linecolor = violin["kwargs"]["edgecolor"]
+
+            # Handle singular datasets (one or more observations with no variance
+            if np.isnan(peak_density):
+                pos = data[self.orient].iloc[0]
+                val = violin["observations"].mean()
+                if self.orient == "x":
+                    x, y = [pos - offsets[0], pos + offsets[1]], [val, val]
+                else:
+                    x, y = [val, val], [pos - offsets[0], pos + offsets[1]]
+                ax.plot(invx(x), invy(y), color=linecolor, linewidth=linewidth)
+                continue
+
+            # Plot the main violin body
+            plot_func = {"x": ax.fill_betweenx, "y": ax.fill_between}[self.orient]
+            plot_func(
+                inv_val(data[value_var]),
+                inv_pos(data[self.orient] - offsets[0]),
+                inv_pos(data[self.orient] + offsets[1]),
+                **violin["kwargs"]
+            )
+
+            # Adjust the observation data
+            obs = violin["observations"]
+            pos_dict = {self.orient: violin["position"], "width": real_width}
+            if dodge:
+                self._dodge(violin["sub_vars"], pos_dict)
+            if gap:
+                pos_dict["width"] *= (1 - gap)
+
+            # --- Plot the inner components
+            if inner is None:
+                continue
+
+            elif inner.startswith("point"):
+                pos = np.array([pos_dict[self.orient]] * len(obs))
+                if split:
+                    pos += (-1 if right_side else 1) * pos_dict["width"] / 2
+                x, y = (pos, obs) if self.orient == "x" else (obs, pos)
+                kws = {
+                    "color": linecolor,
+                    "edgecolor": linecolor,
+                    "s": (linewidth * 2) ** 2,
+                    "zorder": violin["kwargs"].get("zorder", 2) + 1,
+                    **inner_kws,
+                }
+                ax.scatter(invx(x), invy(y), **kws)
+
+            elif inner.startswith("stick"):
+                pos0 = np.interp(obs, data[value_var], data[self.orient] - offsets[0])
+                pos1 = np.interp(obs, data[value_var], data[self.orient] + offsets[1])
+                pos_pts = np.stack([inv_pos(pos0), inv_pos(pos1)])
+                val_pts = np.stack([inv_val(obs), inv_val(obs)])
+                segments = np.stack([pos_pts, val_pts]).transpose(2, 1, 0)
+                if self.orient == "y":
+                    segments = segments[:, :, ::-1]
+                kws = {
+                    "color": linecolor,
+                    "linewidth": linewidth / 2,
+                    **inner_kws,
+                }
+                lines = mpl.collections.LineCollection(segments, **kws)
+                ax.add_collection(lines, autolim=False)
+
+            elif inner.startswith("quart"):
+                stats = np.percentile(obs, [25, 50, 75])
+                pos0 = np.interp(stats, data[value_var], data[self.orient] - offsets[0])
+                pos1 = np.interp(stats, data[value_var], data[self.orient] + offsets[1])
+                pos_pts = np.stack([inv_pos(pos0), inv_pos(pos1)])
+                val_pts = np.stack([inv_val(stats), inv_val(stats)])
+                segments = np.stack([pos_pts, val_pts]).transpose(2, 0, 1)
+                if self.orient == "y":
+                    segments = segments[:, ::-1, :]
+                dashes = [(1.25, .75), (2.5, 1), (1.25, .75)]
+                for i, segment in enumerate(segments):
+                    kws = {
+                        "color": linecolor,
+                        "linewidth": linewidth,
+                        "dashes": dashes[i],
+                        **inner_kws,
+                    }
+                    ax.plot(*segment, **kws)
+
+            elif inner.startswith("box"):
+                stats = mpl.cbook.boxplot_stats(obs)[0]
+                pos = np.array(pos_dict[self.orient])
+                if split:
+                    pos += (-1 if right_side else 1) * pos_dict["width"] / 2
+                pos = [pos, pos], [pos, pos], [pos]
+                val = (
+                    [stats["whislo"], stats["whishi"]],
+                    [stats["q1"], stats["q3"]],
+                    [stats["med"]]
+                )
+                if self.orient == "x":
+                    (x0, x1, x2), (y0, y1, y2) = pos, val
+                else:
+                    (x0, x1, x2), (y0, y1, y2) = val, pos
+
+                if split:
+                    offset = (1 if right_side else -1) * box_width / 72 / 2
+                    dx, dy = (offset, 0) if self.orient == "x" else (0, -offset)
+                    trans = ax.transData + mpl.transforms.ScaledTranslation(
+                        dx, dy, ax.figure.dpi_scale_trans,
+                    )
+                else:
+                    trans = ax.transData
+                line_kws = {
+                    "color": linecolor,
+                    "transform": trans,
+                    **inner_kws,
+                    "linewidth": whis_width,
+                }
+                ax.plot(invx(x0), invy(y0), **line_kws)
+                line_kws["linewidth"] = box_width
+                ax.plot(invx(x1), invy(y1), **line_kws)
+                dot_kws = {
+                    "marker": marker,
+                    "markersize": box_width / 1.2,
+                    "markeredgewidth": box_width / 5,
+                    "transform": trans,
+                    **inner_kws,
+                    "markeredgecolor": "w",
+                    "markerfacecolor": "w",
+                    "color": linecolor,  # simplify tests
+                }
+                ax.plot(invx(x2), invy(y2), **dot_kws)
+
+        self._configure_legend(ax, ax.fill_between)  # TODO, patch_kws)
+
+    def plot_points(
+        self,
+        aggregator,
+        markers,
+        linestyles,
+        dodge,
+        color,
+        capsize,
+        err_kws,
+        plot_kws,
+    ):
+
+        agg_var = {"x": "y", "y": "x"}[self.orient]
+        iter_vars = ["hue"]
+
+        plot_kws = _normalize_kwargs(plot_kws, mpl.lines.Line2D)
+        plot_kws.setdefault("linewidth", mpl.rcParams["lines.linewidth"] * 1.8)
+        plot_kws.setdefault("markeredgewidth", plot_kws["linewidth"] * 0.75)
+        plot_kws.setdefault("markersize", plot_kws["linewidth"] * np.sqrt(2 * np.pi))
+
+        markers = self._map_prop_with_hue("marker", markers, "o", plot_kws)
+        linestyles = self._map_prop_with_hue("linestyle", linestyles, "-", plot_kws)
+
+        positions = self.var_levels[self.orient]
+        if self.var_types[self.orient] == "categorical":
+            min_cat_val = int(self.comp_data[self.orient].min())
+            max_cat_val = int(self.comp_data[self.orient].max())
+            positions = [i for i in range(min_cat_val, max_cat_val + 1)]
+        else:
+            if self._log_scaled(self.orient):
+                positions = np.log10(positions)
+            if self.var_types[self.orient] == "datetime":
+                positions = mpl.dates.date2num(positions)
+        positions = pd.Index(positions, name=self.orient)
+
+        n_hue_levels = 0 if self._hue_map.levels is None else len(self._hue_map.levels)
+        if dodge is True:
+            dodge = .025 * n_hue_levels
+
+        ax = self.ax
+
+        for sub_vars, sub_data in self.iter_data(iter_vars,
+                                                 from_comp_data=True,
+                                                 allow_empty=True):
+
+            ax = self._get_axes(sub_vars)
+
+            agg_data = sub_data if sub_data.empty else (
+                sub_data
+                .groupby(self.orient)
+                .apply(aggregator, agg_var)
+                .reindex(positions)
+                .reset_index()
+            )
+
+            if dodge:
+                hue_idx = self._hue_map.levels.index(sub_vars["hue"])
+                offset = -dodge * (n_hue_levels - 1) / 2 + dodge * hue_idx
+                agg_data[self.orient] += offset * self._native_width
+
+            self._invert_scale(ax, agg_data)
+
+            sub_kws = plot_kws.copy()
+            sub_kws.update(
+                marker=markers[sub_vars.get("hue")],
+                linestyle=linestyles[sub_vars.get("hue")],
+                color=self._hue_map(sub_vars["hue"]) if "hue" in sub_vars else color,
+            )
+
+            line, = ax.plot(agg_data["x"], agg_data["y"], **sub_kws)
+
+            sub_err_kws = err_kws.copy()
+            line_props = line.properties()
+            for prop in ["color", "linewidth", "alpha", "zorder"]:
+                sub_err_kws.setdefault(prop, line_props[prop])
+            if aggregator.error_method is not None:
+                self.plot_errorbars(ax, agg_data, capsize, sub_err_kws)
+
+        semantic_kws = {"hue": {"marker": markers, "linestyle": linestyles}}
+        self._configure_legend(ax, ax.plot, sub_kws, semantic_kws)
+
+    def plot_bars(
+        self,
+        aggregator,
+        dodge,
+        gap,
+        width,
+        fill,
+        color,
+        capsize,
+        err_kws,
+        plot_kws,
+    ):
+
+        agg_var = {"x": "y", "y": "x"}[self.orient]
+        iter_vars = ["hue"]
+
+        ax = self.ax
+
+        if self._hue_map.levels is None:
+            dodge = False
+
+        if dodge and capsize is not None:
+            capsize = capsize / len(self._hue_map.levels)
+
+        if not fill:
+            plot_kws.setdefault("linewidth", 1.5 * mpl.rcParams["lines.linewidth"])
+
+        err_kws.setdefault("linewidth", 1.5 * mpl.rcParams["lines.linewidth"])
+
+        for sub_vars, sub_data in self.iter_data(iter_vars,
+                                                 from_comp_data=True,
+                                                 allow_empty=True):
+
+            ax = self._get_axes(sub_vars)
+
+            agg_data = sub_data if sub_data.empty else (
+                sub_data
+                .groupby(self.orient)
+                .apply(aggregator, agg_var)
+                .reset_index()
+            )
+
+            agg_data["width"] = width * self._native_width
+            if dodge:
+                self._dodge(sub_vars, agg_data)
+            if gap:
+                agg_data["width"] *= 1 - gap
+
+            agg_data["edge"] = agg_data[self.orient] - agg_data["width"] / 2
+            self._invert_scale(ax, agg_data)
+
+            if self.orient == "x":
+                bar_func = ax.bar
+                kws = dict(
+                    x=agg_data["edge"], height=agg_data["y"], width=agg_data["width"]
+                )
+            else:
+                bar_func = ax.barh
+                kws = dict(
+                    y=agg_data["edge"], width=agg_data["x"], height=agg_data["width"]
+                )
+
+            main_color = self._hue_map(sub_vars["hue"]) if "hue" in sub_vars else color
+
+            # Set both color and facecolor for property cycle logic
+            kws["align"] = "edge"
+            if fill:
+                kws.update(color=main_color, facecolor=main_color)
+            else:
+                kws.update(color=main_color, edgecolor=main_color, facecolor="none")
+
+            bar_func(**{**kws, **plot_kws})
+
+            if aggregator.error_method is not None:
+                self.plot_errorbars(
+                    ax, agg_data, capsize,
+                    {"color": ".26" if fill else main_color, **err_kws}
+                )
+
+        self._configure_legend(ax, ax.fill_between)
+
+    def plot_errorbars(self, ax, data, capsize, err_kws):
+
+        var = {"x": "y", "y": "x"}[self.orient]
+        for row in data.to_dict("records"):
+
+            row = dict(row)
+            pos = np.array([row[self.orient], row[self.orient]])
+            val = np.array([row[f"{var}min"], row[f"{var}max"]])
+
+            cw = capsize * self._native_width / 2
+            if self._log_scaled(self.orient):
+                log_pos = np.log10(pos)
+                cap = 10 ** (log_pos[0] - cw), 10 ** (log_pos[1] + cw)
+            else:
+                cap = pos[0] - cw, pos[1] + cw
+
+            if capsize:
+                pos = np.concatenate([
+                    [*cap, np.nan], pos, [np.nan, *cap]
+                ])
+                val = np.concatenate([
+                    [val[0], val[0], np.nan], val, [np.nan, val[-1], val[-1]],
+                ])
+
+            if self.orient == "x":
+                args = pos, val
+            else:
+                args = val, pos
+            ax.plot(*args, **err_kws)
+
+
+class _CategoricalAggPlotter(_CategoricalPlotterNew):
+
+    flat_structure = {"x": "@index", "y": "@values"}
 
 
 class _CategoricalFacetPlotter(_CategoricalPlotterNew):
-
     semantics = _CategoricalPlotterNew.semantics + ("col", "row")
+
+
+class _CategoricalAggFacetPlotter(_CategoricalAggPlotter, _CategoricalFacetPlotter):
+    # Ugh, this is messy
+    pass
 
 
 class _CategoricalPlotter:
@@ -466,7 +1231,7 @@ class _CategoricalPlotter:
                 group_label = data.columns.name
 
                 # Convert to a list of arrays, the common representation
-                iter_data = plot_data.iteritems()
+                iter_data = plot_data.items()
                 plot_data = [np.asarray(s, float) for k, s in iter_data]
 
             # Option 1b:
@@ -519,7 +1284,7 @@ class _CategoricalPlotter:
                 group_names = list(range(len(plot_data)))
 
             # Figure out the plotting orientation
-            orient = "h" if str(orient).startswith("h") else "v"
+            orient = "y" if str(orient)[0] in "hy" else "x"
 
         # Option 2:
         # We are plotting a long-form dataset
@@ -541,9 +1306,7 @@ class _CategoricalPlotter:
                     raise ValueError(err)
 
             # Figure out the plotting orientation
-            orient = infer_orient(
-                x, y, orient, require_numeric=self.require_numeric
-            )
+            orient = infer_orient(x, y, orient, require_numeric=self.require_numeric)
 
             # Option 2a:
             # We are plotting a single set of data
@@ -577,7 +1340,7 @@ class _CategoricalPlotter:
             else:
 
                 # Determine which role each variable will play
-                if orient == "v":
+                if orient == "x":
                     vals, groups = y, x
                 else:
                     vals, groups = x, y
@@ -735,7 +1498,7 @@ class _CategoricalPlotter:
 
     def annotate_axes(self, ax):
         """Add descriptive labels to an Axes object."""
-        if self.orient == "v":
+        if self.orient == "x":
             xlabel, ylabel = self.group_label, self.value_label
         else:
             xlabel, ylabel = self.value_label, self.group_label
@@ -749,14 +1512,14 @@ class _CategoricalPlotter:
         if not group_names:
             group_names = ["" for _ in range(len(self.plot_data))]
 
-        if self.orient == "v":
+        if self.orient == "x":
             ax.set_xticks(np.arange(len(self.plot_data)))
             ax.set_xticklabels(group_names)
         else:
             ax.set_yticks(np.arange(len(self.plot_data)))
             ax.set_yticklabels(group_names)
 
-        if self.orient == "v":
+        if self.orient == "x":
             ax.xaxis.grid(False)
             ax.set_xlim(-.5, len(self.plot_data) - .5, auto=None)
         else:
@@ -774,971 +1537,6 @@ class _CategoricalPlotter:
                              facecolor=color,
                              label=label)
         ax.add_patch(rect)
-
-
-class _BoxPlotter(_CategoricalPlotter):
-
-    def __init__(self, x, y, hue, data, order, hue_order,
-                 orient, color, palette, saturation,
-                 width, dodge, fliersize, linewidth):
-
-        self.establish_variables(x, y, hue, data, orient, order, hue_order)
-        self.establish_colors(color, palette, saturation)
-
-        self.dodge = dodge
-        self.width = width
-        self.fliersize = fliersize
-
-        if linewidth is None:
-            linewidth = mpl.rcParams["lines.linewidth"]
-        self.linewidth = linewidth
-
-    def draw_boxplot(self, ax, kws):
-        """Use matplotlib to draw a boxplot on an Axes."""
-        vert = self.orient == "v"
-
-        props = {}
-        for obj in ["box", "whisker", "cap", "median", "flier"]:
-            props[obj] = kws.pop(obj + "props", {})
-
-        for i, group_data in enumerate(self.plot_data):
-
-            if self.plot_hues is None:
-
-                # Handle case where there is data at this level
-                if group_data.size == 0:
-                    continue
-
-                # Draw a single box or a set of boxes
-                # with a single level of grouping
-                box_data = np.asarray(remove_na(group_data))
-
-                # Handle case where there is no non-null data
-                if box_data.size == 0:
-                    continue
-
-                artist_dict = ax.boxplot(box_data,
-                                         vert=vert,
-                                         patch_artist=True,
-                                         positions=[i],
-                                         widths=self.width,
-                                         **kws)
-                color = self.colors[i]
-                self.restyle_boxplot(artist_dict, color, props)
-            else:
-                # Draw nested groups of boxes
-                offsets = self.hue_offsets
-                for j, hue_level in enumerate(self.hue_names):
-
-                    # Add a legend for this hue level
-                    if not i:
-                        self.add_legend_data(ax, self.colors[j], hue_level)
-
-                    # Handle case where there is data at this level
-                    if group_data.size == 0:
-                        continue
-
-                    hue_mask = self.plot_hues[i] == hue_level
-                    box_data = np.asarray(remove_na(group_data[hue_mask]))
-
-                    # Handle case where there is no non-null data
-                    if box_data.size == 0:
-                        continue
-
-                    center = i + offsets[j]
-                    artist_dict = ax.boxplot(box_data,
-                                             vert=vert,
-                                             patch_artist=True,
-                                             positions=[center],
-                                             widths=self.nested_width,
-                                             **kws)
-                    self.restyle_boxplot(artist_dict, self.colors[j], props)
-                    # Add legend data, but just for one set of boxes
-
-    def restyle_boxplot(self, artist_dict, color, props):
-        """Take a drawn matplotlib boxplot and make it look nice."""
-        for box in artist_dict["boxes"]:
-            box.update(dict(facecolor=color,
-                            zorder=.9,
-                            edgecolor=self.gray,
-                            linewidth=self.linewidth))
-            box.update(props["box"])
-        for whisk in artist_dict["whiskers"]:
-            whisk.update(dict(color=self.gray,
-                              linewidth=self.linewidth,
-                              linestyle="-"))
-            whisk.update(props["whisker"])
-        for cap in artist_dict["caps"]:
-            cap.update(dict(color=self.gray,
-                            linewidth=self.linewidth))
-            cap.update(props["cap"])
-        for med in artist_dict["medians"]:
-            med.update(dict(color=self.gray,
-                            linewidth=self.linewidth))
-            med.update(props["median"])
-        for fly in artist_dict["fliers"]:
-            fly.update(dict(markerfacecolor=self.gray,
-                            marker="d",
-                            markeredgecolor=self.gray,
-                            markersize=self.fliersize))
-            fly.update(props["flier"])
-
-    def plot(self, ax, boxplot_kws):
-        """Make the plot."""
-        self.draw_boxplot(ax, boxplot_kws)
-        self.annotate_axes(ax)
-        if self.orient == "h":
-            ax.invert_yaxis()
-
-
-class _ViolinPlotter(_CategoricalPlotter):
-
-    def __init__(self, x, y, hue, data, order, hue_order,
-                 bw, cut, scale, scale_hue, gridsize,
-                 width, inner, split, dodge, orient, linewidth,
-                 color, palette, saturation):
-
-        self.establish_variables(x, y, hue, data, orient, order, hue_order)
-        self.establish_colors(color, palette, saturation)
-        self.estimate_densities(bw, cut, scale, scale_hue, gridsize)
-
-        self.gridsize = gridsize
-        self.width = width
-        self.dodge = dodge
-
-        if inner is not None:
-            if not any([inner.startswith("quart"),
-                        inner.startswith("box"),
-                        inner.startswith("stick"),
-                        inner.startswith("point")]):
-                err = f"Inner style '{inner}' not recognized"
-                raise ValueError(err)
-        self.inner = inner
-
-        if split and self.hue_names is not None and len(self.hue_names) != 2:
-            msg = "There must be exactly two hue levels to use `split`.'"
-            raise ValueError(msg)
-        self.split = split
-
-        if linewidth is None:
-            linewidth = mpl.rcParams["lines.linewidth"]
-        self.linewidth = linewidth
-
-    def estimate_densities(self, bw, cut, scale, scale_hue, gridsize):
-        """Find the support and density for all of the data."""
-        # Initialize data structures to keep track of plotting data
-        if self.hue_names is None:
-            support = []
-            density = []
-            counts = np.zeros(len(self.plot_data))
-            max_density = np.zeros(len(self.plot_data))
-        else:
-            support = [[] for _ in self.plot_data]
-            density = [[] for _ in self.plot_data]
-            size = len(self.group_names), len(self.hue_names)
-            counts = np.zeros(size)
-            max_density = np.zeros(size)
-
-        for i, group_data in enumerate(self.plot_data):
-
-            # Option 1: we have a single level of grouping
-            # --------------------------------------------
-
-            if self.plot_hues is None:
-
-                # Strip missing datapoints
-                kde_data = remove_na(group_data)
-
-                # Handle special case of no data at this level
-                if kde_data.size == 0:
-                    support.append(np.array([]))
-                    density.append(np.array([1.]))
-                    counts[i] = 0
-                    max_density[i] = 0
-                    continue
-
-                # Handle special case of a single unique datapoint
-                elif np.unique(kde_data).size == 1:
-                    support.append(np.unique(kde_data))
-                    density.append(np.array([1.]))
-                    counts[i] = 1
-                    max_density[i] = 0
-                    continue
-
-                # Fit the KDE and get the used bandwidth size
-                kde, bw_used = self.fit_kde(kde_data, bw)
-
-                # Determine the support grid and get the density over it
-                support_i = self.kde_support(kde_data, bw_used, cut, gridsize)
-                density_i = kde.evaluate(support_i)
-
-                # Update the data structures with these results
-                support.append(support_i)
-                density.append(density_i)
-                counts[i] = kde_data.size
-                max_density[i] = density_i.max()
-
-            # Option 2: we have nested grouping by a hue variable
-            # ---------------------------------------------------
-
-            else:
-                for j, hue_level in enumerate(self.hue_names):
-
-                    # Handle special case of no data at this category level
-                    if not group_data.size:
-                        support[i].append(np.array([]))
-                        density[i].append(np.array([1.]))
-                        counts[i, j] = 0
-                        max_density[i, j] = 0
-                        continue
-
-                    # Select out the observations for this hue level
-                    hue_mask = self.plot_hues[i] == hue_level
-
-                    # Strip missing datapoints
-                    kde_data = remove_na(group_data[hue_mask])
-
-                    # Handle special case of no data at this level
-                    if kde_data.size == 0:
-                        support[i].append(np.array([]))
-                        density[i].append(np.array([1.]))
-                        counts[i, j] = 0
-                        max_density[i, j] = 0
-                        continue
-
-                    # Handle special case of a single unique datapoint
-                    elif np.unique(kde_data).size == 1:
-                        support[i].append(np.unique(kde_data))
-                        density[i].append(np.array([1.]))
-                        counts[i, j] = 1
-                        max_density[i, j] = 0
-                        continue
-
-                    # Fit the KDE and get the used bandwidth size
-                    kde, bw_used = self.fit_kde(kde_data, bw)
-
-                    # Determine the support grid and get the density over it
-                    support_ij = self.kde_support(kde_data, bw_used,
-                                                  cut, gridsize)
-                    density_ij = kde.evaluate(support_ij)
-
-                    # Update the data structures with these results
-                    support[i].append(support_ij)
-                    density[i].append(density_ij)
-                    counts[i, j] = kde_data.size
-                    max_density[i, j] = density_ij.max()
-
-        # Scale the height of the density curve.
-        # For a violinplot the density is non-quantitative.
-        # The objective here is to scale the curves relative to 1 so that
-        # they can be multiplied by the width parameter during plotting.
-
-        if scale == "area":
-            self.scale_area(density, max_density, scale_hue)
-
-        elif scale == "width":
-            self.scale_width(density)
-
-        elif scale == "count":
-            self.scale_count(density, counts, scale_hue)
-
-        else:
-            raise ValueError(f"scale method '{scale}' not recognized")
-
-        # Set object attributes that will be used while plotting
-        self.support = support
-        self.density = density
-
-    def fit_kde(self, x, bw):
-        """Estimate a KDE for a vector of data with flexible bandwidth."""
-        kde = gaussian_kde(x, bw)
-
-        # Extract the numeric bandwidth from the KDE object
-        bw_used = kde.factor
-
-        # At this point, bw will be a numeric scale factor.
-        # To get the actual bandwidth of the kernel, we multiple by the
-        # unbiased standard deviation of the data, which we will use
-        # elsewhere to compute the range of the support.
-        bw_used = bw_used * x.std(ddof=1)
-
-        return kde, bw_used
-
-    def kde_support(self, x, bw, cut, gridsize):
-        """Define a grid of support for the violin."""
-        support_min = x.min() - bw * cut
-        support_max = x.max() + bw * cut
-        return np.linspace(support_min, support_max, gridsize)
-
-    def scale_area(self, density, max_density, scale_hue):
-        """Scale the relative area under the KDE curve.
-
-        This essentially preserves the "standard" KDE scaling, but the
-        resulting maximum density will be 1 so that the curve can be
-        properly multiplied by the violin width.
-
-        """
-        if self.hue_names is None:
-            for d in density:
-                if d.size > 1:
-                    d /= max_density.max()
-        else:
-            for i, group in enumerate(density):
-                for d in group:
-                    if scale_hue:
-                        max = max_density[i].max()
-                    else:
-                        max = max_density.max()
-                    if d.size > 1:
-                        d /= max
-
-    def scale_width(self, density):
-        """Scale each density curve to the same height."""
-        if self.hue_names is None:
-            for d in density:
-                d /= d.max()
-        else:
-            for group in density:
-                for d in group:
-                    d /= d.max()
-
-    def scale_count(self, density, counts, scale_hue):
-        """Scale each density curve by the number of observations."""
-        if self.hue_names is None:
-            if counts.max() == 0:
-                d = 0
-            else:
-                for count, d in zip(counts, density):
-                    d /= d.max()
-                    d *= count / counts.max()
-        else:
-            for i, group in enumerate(density):
-                for j, d in enumerate(group):
-                    if counts[i].max() == 0:
-                        d = 0
-                    else:
-                        count = counts[i, j]
-                        if scale_hue:
-                            scaler = count / counts[i].max()
-                        else:
-                            scaler = count / counts.max()
-                        d /= d.max()
-                        d *= scaler
-
-    @property
-    def dwidth(self):
-
-        if self.hue_names is None or not self.dodge:
-            return self.width / 2
-        elif self.split:
-            return self.width / 2
-        else:
-            return self.width / (2 * len(self.hue_names))
-
-    def draw_violins(self, ax):
-        """Draw the violins onto `ax`."""
-        fill_func = ax.fill_betweenx if self.orient == "v" else ax.fill_between
-        for i, group_data in enumerate(self.plot_data):
-
-            kws = dict(edgecolor=self.gray, linewidth=self.linewidth)
-
-            # Option 1: we have a single level of grouping
-            # --------------------------------------------
-
-            if self.plot_hues is None:
-
-                support, density = self.support[i], self.density[i]
-
-                # Handle special case of no observations in this bin
-                if support.size == 0:
-                    continue
-
-                # Handle special case of a single observation
-                elif support.size == 1:
-                    val = support.item()
-                    d = density.item()
-                    self.draw_single_observation(ax, i, val, d)
-                    continue
-
-                # Draw the violin for this group
-                grid = np.ones(self.gridsize) * i
-                fill_func(support,
-                          grid - density * self.dwidth,
-                          grid + density * self.dwidth,
-                          facecolor=self.colors[i],
-                          **kws)
-
-                # Draw the interior representation of the data
-                if self.inner is None:
-                    continue
-
-                # Get a nan-free vector of datapoints
-                violin_data = remove_na(group_data)
-
-                # Draw box and whisker information
-                if self.inner.startswith("box"):
-                    self.draw_box_lines(ax, violin_data, i)
-
-                # Draw quartile lines
-                elif self.inner.startswith("quart"):
-                    self.draw_quartiles(ax, violin_data, support, density, i)
-
-                # Draw stick observations
-                elif self.inner.startswith("stick"):
-                    self.draw_stick_lines(ax, violin_data, support, density, i)
-
-                # Draw point observations
-                elif self.inner.startswith("point"):
-                    self.draw_points(ax, violin_data, i)
-
-            # Option 2: we have nested grouping by a hue variable
-            # ---------------------------------------------------
-
-            else:
-                offsets = self.hue_offsets
-                for j, hue_level in enumerate(self.hue_names):
-
-                    support, density = self.support[i][j], self.density[i][j]
-                    kws["facecolor"] = self.colors[j]
-
-                    # Add legend data, but just for one set of violins
-                    if not i:
-                        self.add_legend_data(ax, self.colors[j], hue_level)
-
-                    # Handle the special case where we have no observations
-                    if support.size == 0:
-                        continue
-
-                    # Handle the special case where we have one observation
-                    elif support.size == 1:
-                        val = support.item()
-                        d = density.item()
-                        if self.split:
-                            d = d / 2
-                        at_group = i + offsets[j]
-                        self.draw_single_observation(ax, at_group, val, d)
-                        continue
-
-                    # Option 2a: we are drawing a single split violin
-                    # -----------------------------------------------
-
-                    if self.split:
-
-                        grid = np.ones(self.gridsize) * i
-                        if j:
-                            fill_func(support,
-                                      grid,
-                                      grid + density * self.dwidth,
-                                      **kws)
-                        else:
-                            fill_func(support,
-                                      grid - density * self.dwidth,
-                                      grid,
-                                      **kws)
-
-                        # Draw the interior representation of the data
-                        if self.inner is None:
-                            continue
-
-                        # Get a nan-free vector of datapoints
-                        hue_mask = self.plot_hues[i] == hue_level
-                        violin_data = remove_na(group_data[hue_mask])
-
-                        # Draw quartile lines
-                        if self.inner.startswith("quart"):
-                            self.draw_quartiles(ax, violin_data,
-                                                support, density, i,
-                                                ["left", "right"][j])
-
-                        # Draw stick observations
-                        elif self.inner.startswith("stick"):
-                            self.draw_stick_lines(ax, violin_data,
-                                                  support, density, i,
-                                                  ["left", "right"][j])
-
-                        # The box and point interior plots are drawn for
-                        # all data at the group level, so we just do that once
-                        if j and any(self.plot_hues[0] == hue_level):
-                            continue
-
-                        # Get the whole vector for this group level
-                        violin_data = remove_na(group_data)
-
-                        # Draw box and whisker information
-                        if self.inner.startswith("box"):
-                            self.draw_box_lines(ax, violin_data, i)
-
-                        # Draw point observations
-                        elif self.inner.startswith("point"):
-                            self.draw_points(ax, violin_data, i)
-
-                    # Option 2b: we are drawing full nested violins
-                    # -----------------------------------------------
-
-                    else:
-                        grid = np.ones(self.gridsize) * (i + offsets[j])
-                        fill_func(support,
-                                  grid - density * self.dwidth,
-                                  grid + density * self.dwidth,
-                                  **kws)
-
-                        # Draw the interior representation
-                        if self.inner is None:
-                            continue
-
-                        # Get a nan-free vector of datapoints
-                        hue_mask = self.plot_hues[i] == hue_level
-                        violin_data = remove_na(group_data[hue_mask])
-
-                        # Draw box and whisker information
-                        if self.inner.startswith("box"):
-                            self.draw_box_lines(ax, violin_data, i + offsets[j])
-
-                        # Draw quartile lines
-                        elif self.inner.startswith("quart"):
-                            self.draw_quartiles(ax, violin_data,
-                                                support, density,
-                                                i + offsets[j])
-
-                        # Draw stick observations
-                        elif self.inner.startswith("stick"):
-                            self.draw_stick_lines(ax, violin_data,
-                                                  support, density,
-                                                  i + offsets[j])
-
-                        # Draw point observations
-                        elif self.inner.startswith("point"):
-                            self.draw_points(ax, violin_data, i + offsets[j])
-
-    def draw_single_observation(self, ax, at_group, at_quant, density):
-        """Draw a line to mark a single observation."""
-        d_width = density * self.dwidth
-        if self.orient == "v":
-            ax.plot([at_group - d_width, at_group + d_width],
-                    [at_quant, at_quant],
-                    color=self.gray,
-                    linewidth=self.linewidth)
-        else:
-            ax.plot([at_quant, at_quant],
-                    [at_group - d_width, at_group + d_width],
-                    color=self.gray,
-                    linewidth=self.linewidth)
-
-    def draw_box_lines(self, ax, data, center):
-        """Draw boxplot information at center of the density."""
-        # Compute the boxplot statistics
-        q25, q50, q75 = np.percentile(data, [25, 50, 75])
-        whisker_lim = 1.5 * (q75 - q25)
-        h1 = np.min(data[data >= (q25 - whisker_lim)])
-        h2 = np.max(data[data <= (q75 + whisker_lim)])
-
-        # Draw a boxplot using lines and a point
-        if self.orient == "v":
-            ax.plot([center, center], [h1, h2],
-                    linewidth=self.linewidth,
-                    color=self.gray)
-            ax.plot([center, center], [q25, q75],
-                    linewidth=self.linewidth * 3,
-                    color=self.gray)
-            ax.scatter(center, q50,
-                       zorder=3,
-                       color="white",
-                       edgecolor=self.gray,
-                       s=np.square(self.linewidth * 2))
-        else:
-            ax.plot([h1, h2], [center, center],
-                    linewidth=self.linewidth,
-                    color=self.gray)
-            ax.plot([q25, q75], [center, center],
-                    linewidth=self.linewidth * 3,
-                    color=self.gray)
-            ax.scatter(q50, center,
-                       zorder=3,
-                       color="white",
-                       edgecolor=self.gray,
-                       s=np.square(self.linewidth * 2))
-
-    def draw_quartiles(self, ax, data, support, density, center, split=False):
-        """Draw the quartiles as lines at width of density."""
-        q25, q50, q75 = np.percentile(data, [25, 50, 75])
-
-        self.draw_to_density(ax, center, q25, support, density, split,
-                             linewidth=self.linewidth,
-                             dashes=[self.linewidth * 1.5] * 2)
-        self.draw_to_density(ax, center, q50, support, density, split,
-                             linewidth=self.linewidth,
-                             dashes=[self.linewidth * 3] * 2)
-        self.draw_to_density(ax, center, q75, support, density, split,
-                             linewidth=self.linewidth,
-                             dashes=[self.linewidth * 1.5] * 2)
-
-    def draw_points(self, ax, data, center):
-        """Draw individual observations as points at middle of the violin."""
-        kws = dict(s=np.square(self.linewidth * 2),
-                   color=self.gray,
-                   edgecolor=self.gray)
-
-        grid = np.ones(len(data)) * center
-
-        if self.orient == "v":
-            ax.scatter(grid, data, **kws)
-        else:
-            ax.scatter(data, grid, **kws)
-
-    def draw_stick_lines(self, ax, data, support, density,
-                         center, split=False):
-        """Draw individual observations as sticks at width of density."""
-        for val in data:
-            self.draw_to_density(ax, center, val, support, density, split,
-                                 linewidth=self.linewidth * .5)
-
-    def draw_to_density(self, ax, center, val, support, density, split, **kws):
-        """Draw a line orthogonal to the value axis at width of density."""
-        idx = np.argmin(np.abs(support - val))
-        width = self.dwidth * density[idx] * .99
-
-        kws["color"] = self.gray
-
-        if self.orient == "v":
-            if split == "left":
-                ax.plot([center - width, center], [val, val], **kws)
-            elif split == "right":
-                ax.plot([center, center + width], [val, val], **kws)
-            else:
-                ax.plot([center - width, center + width], [val, val], **kws)
-        else:
-            if split == "left":
-                ax.plot([val, val], [center - width, center], **kws)
-            elif split == "right":
-                ax.plot([val, val], [center, center + width], **kws)
-            else:
-                ax.plot([val, val], [center - width, center + width], **kws)
-
-    def plot(self, ax):
-        """Make the violin plot."""
-        self.draw_violins(ax)
-        self.annotate_axes(ax)
-        if self.orient == "h":
-            ax.invert_yaxis()
-
-
-class _CategoricalStatPlotter(_CategoricalPlotter):
-
-    require_numeric = True
-
-    @property
-    def nested_width(self):
-        """A float with the width of plot elements when hue nesting is used."""
-        if self.dodge:
-            width = self.width / len(self.hue_names)
-        else:
-            width = self.width
-        return width
-
-    def estimate_statistic(self, estimator, errorbar, n_boot, seed):
-
-        if self.hue_names is None:
-            statistic = []
-            confint = []
-        else:
-            statistic = [[] for _ in self.plot_data]
-            confint = [[] for _ in self.plot_data]
-
-        var = {"v": "y", "h": "x"}[self.orient]
-
-        agg = EstimateAggregator(estimator, errorbar, n_boot=n_boot, seed=seed)
-
-        for i, group_data in enumerate(self.plot_data):
-
-            # Option 1: we have a single layer of grouping
-            # --------------------------------------------
-            if self.plot_hues is None:
-
-                df = pd.DataFrame({var: group_data})
-                if self.plot_units is not None:
-                    df["units"] = self.plot_units[i]
-
-                res = agg(df, var)
-
-                statistic.append(res[var])
-                if errorbar is not None:
-                    confint.append((res[f"{var}min"], res[f"{var}max"]))
-
-            # Option 2: we are grouping by a hue layer
-            # ----------------------------------------
-
-            else:
-                for hue_level in self.hue_names:
-
-                    if not self.plot_hues[i].size:
-                        statistic[i].append(np.nan)
-                        if errorbar is not None:
-                            confint[i].append((np.nan, np.nan))
-                        continue
-
-                    hue_mask = self.plot_hues[i] == hue_level
-                    df = pd.DataFrame({var: group_data[hue_mask]})
-                    if self.plot_units is not None:
-                        df["units"] = self.plot_units[i][hue_mask]
-
-                    res = agg(df, var)
-
-                    statistic[i].append(res[var])
-                    if errorbar is not None:
-                        confint[i].append((res[f"{var}min"], res[f"{var}max"]))
-
-        # Save the resulting values for plotting
-        self.statistic = np.array(statistic)
-        self.confint = np.array(confint)
-
-    def draw_confints(self, ax, at_group, confint, colors,
-                      errwidth=None, capsize=None, **kws):
-
-        if errwidth is not None:
-            kws.setdefault("lw", errwidth)
-        else:
-            kws.setdefault("lw", mpl.rcParams["lines.linewidth"] * 1.8)
-
-        for at, (ci_low, ci_high), color in zip(at_group,
-                                                confint,
-                                                colors):
-            if self.orient == "v":
-                ax.plot([at, at], [ci_low, ci_high], color=color, **kws)
-                if capsize is not None:
-                    ax.plot([at - capsize / 2, at + capsize / 2],
-                            [ci_low, ci_low], color=color, **kws)
-                    ax.plot([at - capsize / 2, at + capsize / 2],
-                            [ci_high, ci_high], color=color, **kws)
-            else:
-                ax.plot([ci_low, ci_high], [at, at], color=color, **kws)
-                if capsize is not None:
-                    ax.plot([ci_low, ci_low],
-                            [at - capsize / 2, at + capsize / 2],
-                            color=color, **kws)
-                    ax.plot([ci_high, ci_high],
-                            [at - capsize / 2, at + capsize / 2],
-                            color=color, **kws)
-
-
-class _BarPlotter(_CategoricalStatPlotter):
-
-    def __init__(self, x, y, hue, data, order, hue_order,
-                 estimator, errorbar, n_boot, units, seed,
-                 orient, color, palette, saturation, width,
-                 errcolor, errwidth, capsize, dodge):
-        """Initialize the plotter."""
-        self.establish_variables(x, y, hue, data, orient,
-                                 order, hue_order, units)
-        self.establish_colors(color, palette, saturation)
-        self.estimate_statistic(estimator, errorbar, n_boot, seed)
-
-        self.dodge = dodge
-        self.width = width
-
-        self.errcolor = errcolor
-        self.errwidth = errwidth
-        self.capsize = capsize
-
-    def draw_bars(self, ax, kws):
-        """Draw the bars onto `ax`."""
-        # Get the right matplotlib function depending on the orientation
-        barfunc = ax.bar if self.orient == "v" else ax.barh
-        barpos = np.arange(len(self.statistic))
-
-        if self.plot_hues is None:
-
-            # Draw the bars
-            barfunc(barpos, self.statistic, self.width,
-                    color=self.colors, align="center", **kws)
-
-            # Draw the confidence intervals
-            errcolors = [self.errcolor] * len(barpos)
-            self.draw_confints(ax,
-                               barpos,
-                               self.confint,
-                               errcolors,
-                               self.errwidth,
-                               self.capsize)
-
-        else:
-
-            for j, hue_level in enumerate(self.hue_names):
-
-                # Draw the bars
-                offpos = barpos + self.hue_offsets[j]
-                barfunc(offpos, self.statistic[:, j], self.nested_width,
-                        color=self.colors[j], align="center",
-                        label=hue_level, **kws)
-
-                # Draw the confidence intervals
-                if self.confint.size:
-                    confint = self.confint[:, j]
-                    errcolors = [self.errcolor] * len(offpos)
-                    self.draw_confints(ax,
-                                       offpos,
-                                       confint,
-                                       errcolors,
-                                       self.errwidth,
-                                       self.capsize)
-
-    def plot(self, ax, bar_kws):
-        """Make the plot."""
-        self.draw_bars(ax, bar_kws)
-        self.annotate_axes(ax)
-        if self.orient == "h":
-            ax.invert_yaxis()
-
-
-class _PointPlotter(_CategoricalStatPlotter):
-
-    default_palette = "dark"
-
-    def __init__(self, x, y, hue, data, order, hue_order,
-                 estimator, errorbar, n_boot, units, seed,
-                 markers, linestyles, dodge, join, scale,
-                 orient, color, palette, errwidth=None, capsize=None):
-        """Initialize the plotter."""
-        self.establish_variables(x, y, hue, data, orient,
-                                 order, hue_order, units)
-        self.establish_colors(color, palette, 1)
-        self.estimate_statistic(estimator, errorbar, n_boot, seed)
-
-        # Override the default palette for single-color plots
-        if hue is None and color is None and palette is None:
-            self.colors = [color_palette()[0]] * len(self.colors)
-
-        # Don't join single-layer plots with different colors
-        if hue is None and palette is not None:
-            join = False
-
-        # Use a good default for `dodge=True`
-        if dodge is True and self.hue_names is not None:
-            dodge = .025 * len(self.hue_names)
-
-        # Make sure we have a marker for each hue level
-        if isinstance(markers, str):
-            markers = [markers] * len(self.colors)
-        self.markers = markers
-
-        # Make sure we have a line style for each hue level
-        if isinstance(linestyles, str):
-            linestyles = [linestyles] * len(self.colors)
-        self.linestyles = linestyles
-
-        # Set the other plot components
-        self.dodge = dodge
-        self.join = join
-        self.scale = scale
-        self.errwidth = errwidth
-        self.capsize = capsize
-
-    @property
-    def hue_offsets(self):
-        """Offsets relative to the center position for each hue level."""
-        if self.dodge:
-            offset = np.linspace(0, self.dodge, len(self.hue_names))
-            offset -= offset.mean()
-        else:
-            offset = np.zeros(len(self.hue_names))
-        return offset
-
-    def draw_points(self, ax):
-        """Draw the main data components of the plot."""
-        # Get the center positions on the categorical axis
-        pointpos = np.arange(len(self.statistic))
-
-        # Get the size of the plot elements
-        lw = mpl.rcParams["lines.linewidth"] * 1.8 * self.scale
-        mew = lw * .75
-        markersize = np.pi * np.square(lw) * 2
-
-        if self.plot_hues is None:
-
-            # Draw lines joining each estimate point
-            if self.join:
-                color = self.colors[0]
-                ls = self.linestyles[0]
-                if self.orient == "h":
-                    ax.plot(self.statistic, pointpos,
-                            color=color, ls=ls, lw=lw)
-                else:
-                    ax.plot(pointpos, self.statistic,
-                            color=color, ls=ls, lw=lw)
-
-            # Draw the confidence intervals
-            self.draw_confints(ax, pointpos, self.confint, self.colors,
-                               self.errwidth, self.capsize)
-
-            # Draw the estimate points
-            marker = self.markers[0]
-            colors = [mpl.colors.colorConverter.to_rgb(c) for c in self.colors]
-            if self.orient == "h":
-                x, y = self.statistic, pointpos
-            else:
-                x, y = pointpos, self.statistic
-            ax.scatter(x, y,
-                       linewidth=mew, marker=marker, s=markersize,
-                       facecolor=colors, edgecolor=colors)
-
-        else:
-
-            offsets = self.hue_offsets
-            for j, hue_level in enumerate(self.hue_names):
-
-                # Determine the values to plot for this level
-                statistic = self.statistic[:, j]
-
-                # Determine the position on the categorical and z axes
-                offpos = pointpos + offsets[j]
-                z = j + 1
-
-                # Draw lines joining each estimate point
-                if self.join:
-                    color = self.colors[j]
-                    ls = self.linestyles[j]
-                    if self.orient == "h":
-                        ax.plot(statistic, offpos, color=color,
-                                zorder=z, ls=ls, lw=lw)
-                    else:
-                        ax.plot(offpos, statistic, color=color,
-                                zorder=z, ls=ls, lw=lw)
-
-                # Draw the confidence intervals
-                if self.confint.size:
-                    confint = self.confint[:, j]
-                    errcolors = [self.colors[j]] * len(offpos)
-                    self.draw_confints(ax, offpos, confint, errcolors,
-                                       self.errwidth, self.capsize,
-                                       zorder=z)
-
-                # Draw the estimate points
-                n_points = len(remove_na(offpos))
-                marker = self.markers[j]
-                color = mpl.colors.colorConverter.to_rgb(self.colors[j])
-
-                if self.orient == "h":
-                    x, y = statistic, offpos
-                else:
-                    x, y = offpos, statistic
-
-                if not len(remove_na(statistic)):
-                    x = y = [np.nan] * n_points
-
-                ax.scatter(x, y, label=hue_level,
-                           facecolor=color, edgecolor=color,
-                           linewidth=mew, marker=marker, s=markersize,
-                           zorder=z)
-
-    def plot(self, ax):
-        """Make the plot."""
-        self.draw_points(ax)
-        self.annotate_axes(ax)
-        if self.orient == "h":
-            ax.invert_yaxis()
-
-
-class _CountPlotter(_BarPlotter):
-    require_numeric = False
 
 
 class _LVPlotter(_CategoricalPlotter):
@@ -1775,7 +1573,7 @@ class _LVPlotter(_CategoricalPlotter):
         self.outlier_prop = outlier_prop
 
         if not 0 < trust_alpha < 1:
-            msg = f'trust_alpha {trust_alpha} not in range (0, 1)'
+            msg = f'trust_alpha {trust_alpha} not in range (0, 1) '
             raise ValueError(msg)
         self.trust_alpha = trust_alpha
 
@@ -1790,7 +1588,7 @@ class _LVPlotter(_CategoricalPlotter):
         vals = np.asarray(vals)
         # Remove infinite values while handling a 'object' dtype
         # that can come from pd.Float64Dtype() input
-        with pd.option_context('mode.use_inf_as_null', True):
+        with pd.option_context('mode.use_inf_as_na', True):
             vals = vals[~pd.isnull(vals)]
         n = len(vals)
         p = self.outlier_prop
@@ -1868,7 +1666,7 @@ class _LVPlotter(_CategoricalPlotter):
         for k, v in flier_default_kws.items():
             flier_kws.setdefault(k, v)
 
-        vert = self.orient == "v"
+        vert = self.orient == "x"
         x = positions[0]
         box_data = np.asarray(box_data)
 
@@ -2037,13 +1835,13 @@ class _LVPlotter(_CategoricalPlotter):
                                  line_kws=line_kws)
 
         # Autoscale the values axis to make sure all patches are visible
-        ax.autoscale_view(scalex=self.orient == "h", scaley=self.orient == "v")
+        ax.autoscale_view(scalex=self.orient == "y", scaley=self.orient == "x")
 
     def plot(self, ax, box_kws, flier_kws, line_kws):
         """Make the plot."""
         self.draw_letter_value_plot(ax, box_kws, flier_kws, line_kws)
         self.annotate_axes(ax)
-        if self.orient == "h":
+        if self.orient == "y":
             ax.invert_yaxis()
 
 
@@ -2063,23 +1861,23 @@ _categorical_docs = dict(
     .. note::
         By default, this function treats one of the variables as categorical
         and draws data at ordinal positions (0, 1, ... n) on the relevant axis.
-        This can be disabled with the `native_scale` parameter.
+        As of version 0.13.0, this can be disabled by setting `native_scale=True`.
 
-        See the :ref:`tutorial <categorical_tutorial>` for more information.\
+    See the :ref:`tutorial <categorical_tutorial>` for more information.\
     """),
 
     # Shared function parameters
     input_params=dedent("""\
-    x, y, hue : names of variables in ``data`` or vector data, optional
+    x, y, hue : names of variables in `data` or vector data
         Inputs for plotting long-form data. See examples for interpretation.\
     """),
     string_input_params=dedent("""\
-    x, y, hue : names of variables in ``data``
+    x, y, hue : names of variables in `data`
         Inputs for plotting long-form data. See examples for interpretation.\
     """),
     categorical_data=dedent("""\
-    data : DataFrame, array, or list of arrays, optional
-        Dataset for plotting. If ``x`` and ``y`` are absent, this is
+    data : DataFrame, Series, dict, array, or list of arrays
+        Dataset for plotting. If `x` and `y` are absent, this is
         interpreted as wide-form. Otherwise it is expected to be long-form.\
     """),
     long_form_data=dedent("""\
@@ -2088,94 +1886,149 @@ _categorical_docs = dict(
         to a variable, and each row should correspond to an observation.\
     """),
     order_vars=dedent("""\
-    order, hue_order : lists of strings, optional
+    order, hue_order : lists of strings
         Order to plot the categorical levels in; otherwise the levels are
         inferred from the data objects.\
     """),
     stat_api_params=dedent("""\
-    estimator : string or callable that maps vector -> scalar, optional
+    estimator : string or callable that maps vector -> scalar
         Statistical function to estimate within each categorical bin.
-    errorbar : string, (string, number) tuple, or callable
+    errorbar : string, (string, number) tuple, callable or None
         Name of errorbar method (either "ci", "pi", "se", or "sd"), or a tuple
         with a method name and a level parameter, or a function that maps from a
-        vector to a (min, max) interval.
-    n_boot : int, optional
+        vector to a (min, max) interval, or None to hide errorbar.
+
+        .. versionadded:: v0.12.0
+    n_boot : int
         Number of bootstrap samples used to compute confidence intervals.
-    units : name of variable in ``data`` or vector data, optional
+    units : name of variable in `data` or vector data
         Identifier of sampling units, which will be used to perform a
         multilevel bootstrap and account for repeated measures design.
-    seed : int, numpy.random.Generator, or numpy.random.RandomState, optional
+    seed : int, `numpy.random.Generator`, or `numpy.random.RandomState`
         Seed or random number generator for reproducible bootstrapping.\
     """),
+    ci=dedent("""\
+    ci : float
+        Level of the confidence interval to show, in [0, 100].
+
+        .. deprecated:: v0.12.0
+            Use `errorbar=("ci", ...)`.\
+    """),
     orient=dedent("""\
-    orient : "v" | "h", optional
+    orient : "v" | "h" | "x" | "y"
         Orientation of the plot (vertical or horizontal). This is usually
         inferred based on the type of the input variables, but it can be used
         to resolve ambiguity when both `x` and `y` are numeric or when
-        plotting wide-form data.\
+        plotting wide-form data.
+
+        .. versionchanged:: v0.13.0
+            Added 'x'/'y' as options, equivalent to 'v'/'h'.\
     """),
     color=dedent("""\
-    color : matplotlib color, optional
+    color : matplotlib color
         Single color for the elements in the plot.\
     """),
     palette=dedent("""\
-    palette : palette name, list, or dict, optional
+    palette : palette name, list, dict, or :class:`matplotlib.colors.Colormap`
         Color palette that maps the hue variable. If the palette is a dictionary,
-        keys should be names of levels and values should be matplotlib colors.\
+        keys should be names of levels and values should be matplotlib colors.
+        The type/value will sometimes force a qualitative/quantitative mapping.\
     """),
     hue_norm=dedent("""\
     hue_norm : tuple or :class:`matplotlib.colors.Normalize` object
         Normalization in data units for colormap applied to the `hue`
-        variable when it is numeric. Not relevant if `hue` is categorical.\
+        variable when it is numeric. Not relevant if `hue` is categorical.
+
+        .. versionadded:: v0.12.0\
     """),
     saturation=dedent("""\
-    saturation : float, optional
-        Proportion of the original saturation to draw colors at. Large patches
-        often look better with slightly desaturated colors, but set this to
-        `1` if you want the plot colors to perfectly match the input color.\
+    saturation : float
+        Proportion of the original saturation to draw fill colors in. Large
+        patches often look better with desaturated colors, but set this to
+        `1` if you want the colors to perfectly match the input values.\
     """),
     capsize=dedent("""\
-    capsize : float, optional
-        Width of the "caps" on error bars./
+    capsize : float
+        Width of the "caps" on error bars, relative to bar spacing.\
+    """),
+    errcolor=dedent("""\
+    errcolor : matplotlib color
+        Color used for the error bar lines.
+
+        .. deprecated:: 0.13.0
+            Use `err_kws={'color': ...}`.\
     """),
     errwidth=dedent("""\
-    errwidth : float, optional
-        Thickness of error bar lines (and caps).\
+    errwidth : float
+        Thickness of error bar lines (and caps), in points.
+
+        .. deprecated:: 0.13.0
+            Use `err_kws={'linewidth': ...}`.\
+    """),
+    fill=dedent("""\
+    fill : bool
+        If True, use a solid patch. Otherwise, draw as line art.
+
+        .. versionadded:: v0.13.0\
+    """),
+    gap=dedent("""\
+    gap : float
+        Shrink on the orient axis by this factor to add a gap between dodged elements.
+
+        .. versionadded:: 0.13.0\
     """),
     width=dedent("""\
-    width : float, optional
+    width : float
         Width of a full element when not using hue nesting, or width of all the
         elements for one level of the major grouping variable.\
     """),
     dodge=dedent("""\
-    dodge : bool, optional
+    dodge : bool
         When hue nesting is used, whether elements should be shifted along the
         categorical axis.\
     """),
     linewidth=dedent("""\
-    linewidth : float, optional
-        Width of the gray lines that frame the plot elements.\
+    linewidth : float
+        Width of the lines that frame the plot elements.\
+    """),
+    linecolor=dedent("""\
+    linecolor : color
+        Color to use for line elements, when `fill` is True.
+
+        .. versionadded:: v0.13.0\
     """),
     native_scale=dedent("""\
-    native_scale : bool, optional
+    native_scale : bool
         When True, numeric or datetime values on the categorical axis will maintain
-        their original scaling rather than being converted to fixed indices.\
+        their original scaling rather than being converted to fixed indices.
+
+        .. versionadded:: v0.13.0\
     """),
     formatter=dedent("""\
-    formatter : callable, optional
+    formatter : callable
         Function for converting categorical data into strings. Affects both grouping
-        and tick labels.\
+        and tick labels.
+
+        .. versionadded:: v0.13.0\
     """),
     legend=dedent("""\
-legend : "auto", "brief", "full", or False
-    How to draw the legend. If "brief", numeric `hue` and `size`
-    variables will be represented with a sample of evenly spaced values.
-    If "full", every group will get an entry in the legend. If "auto",
-    choose between brief or full representation based on number of levels.
-    If `False`, no legend data is added and no legend is drawn.
+    legend : "auto", "brief", "full", or False
+        How to draw the legend. If "brief", numeric `hue` and `size`
+        variables will be represented with a sample of evenly spaced values.
+        If "full", every group will get an entry in the legend. If "auto",
+        choose between brief or full representation based on number of levels.
+        If `False`, no legend data is added and no legend is drawn.
+
+        .. versionadded:: v0.13.0\
+    """),
+    err_kws=dedent("""\
+    err_kws : dict
+        Parameters of :class:`matplotlib.lines.Line2D`, for the error bar artists.
+
+        .. versionadded:: v0.13.0\
     """),
     ax_in=dedent("""\
-    ax : matplotlib Axes, optional
+    ax : matplotlib Axes
         Axes object to draw the plot onto, otherwise uses the current Axes.\
     """),
     ax_out=dedent("""\
@@ -2222,20 +2075,64 @@ _categorical_docs.update(_facet_docs)
 
 def boxplot(
     data=None, *, x=None, y=None, hue=None, order=None, hue_order=None,
-    orient=None, color=None, palette=None, saturation=.75, width=.8,
-    dodge=True, fliersize=5, linewidth=None, whis=1.5, ax=None,
-    **kwargs
+    orient=None, color=None, palette=None, saturation=.75, fill=True,
+    dodge="auto", width=.8, gap=0, whis=1.5, linecolor=None, linewidth=None,
+    fliersize=None, hue_norm=None, native_scale=False, formatter=None,
+    legend="auto", ax=None, **kwargs
 ):
 
-    plotter = _BoxPlotter(x, y, hue, data, order, hue_order,
-                          orient, color, palette, saturation,
-                          width, dodge, fliersize, linewidth)
+    p = _CategoricalPlotterNew(
+        data=data,
+        variables=_CategoricalPlotterNew.get_semantics(locals()),
+        order=order,
+        orient=orient,
+        require_numeric=False,
+        legend=legend,
+    )
 
     if ax is None:
         ax = plt.gca()
-    kwargs.update(dict(whis=whis))
 
-    plotter.plot(ax, kwargs)
+    if p.plot_data.empty:
+        return ax
+
+    if dodge == "auto":
+        # Needs to be before scale_categorical changes the coordinate series dtype
+        dodge = p._dodge_needed()
+
+    if p.var_types.get(p.orient) == "categorical" or not native_scale:
+        p.scale_categorical(p.orient, order=order, formatter=formatter)
+
+    p._attach(ax)
+
+    # Deprecations to remove in v0.14.0.
+    hue_order = p._palette_without_hue_backcompat(palette, hue_order)
+    palette, hue_order = p._hue_backcompat(color, palette, hue_order)
+
+    saturation = saturation if fill else 1
+    p.map_hue(palette=palette, order=hue_order, norm=hue_norm, saturation=saturation)
+    color = _default_color(
+        ax.fill_between, hue, color,
+        {k: v for k, v in kwargs.items() if k in ["c", "color", "fc", "facecolor"]},
+        saturation=saturation,
+    )
+
+    p.plot_boxes(
+        width=width,
+        dodge=dodge,
+        gap=gap,
+        fill=fill,
+        whis=whis,
+        color=color,
+        linecolor=linecolor,
+        linewidth=linewidth,
+        fliersize=fliersize,
+        plot_kws=kwargs,
+    )
+
+    p._add_axis_labels(ax)
+    p._adjust_cat_axis(ax, axis=p.orient)
+
     return ax
 
 
@@ -2249,7 +2146,7 @@ boxplot.__doc__ = dedent("""\
     except for points that are determined to be "outliers" using a method
     that is a function of the inter-quartile range.
 
-    {categorical_narrative}
+    {new_categorical_narrative}
 
     Parameters
     ----------
@@ -2260,15 +2157,22 @@ boxplot.__doc__ = dedent("""\
     {color}
     {palette}
     {saturation}
-    {width}
+    {fill}
     {dodge}
-    fliersize : float, optional
-        Size of the markers used to indicate outlier observations.
+    {width}
+    {gap}
+    whis : float or pair of floats
+        Paramater that controls whisker length. If scalar, whiskers are drawn
+        to the farthest datapoint within `whis * IQR` from the nearest hinge.
+        If a tuple, it is interpreted as percentiles that whiskers represent.
+    {linecolor}
     {linewidth}
-    whis : float, optional
-        Maximum length of the plot whiskers as proportion of the
-        interquartile range. Whiskers extend to the furthest datapoint
-        within that range. More extreme points are marked as outliers.
+    fliersize : float
+        Size of the markers used to indicate outlier observations.
+    {hue_norm}
+    {native_scale}
+    {formatter}
+    {legend}
     {ax_in}
     kwargs : key, value mappings
         Other keyword arguments are passed through to
@@ -2287,7 +2191,6 @@ boxplot.__doc__ = dedent("""\
 
     Examples
     --------
-
     .. include:: ../docstrings/boxplot.rst
 
     """).format(**_categorical_docs)
@@ -2295,86 +2198,181 @@ boxplot.__doc__ = dedent("""\
 
 def violinplot(
     data=None, *, x=None, y=None, hue=None, order=None, hue_order=None,
-    bw="scott", cut=2, scale="area", scale_hue=True, gridsize=100,
-    width=.8, inner="box", split=False, dodge=True, orient=None,
-    linewidth=None, color=None, palette=None, saturation=.75,
-    ax=None, **kwargs,
+    orient=None, color=None, palette=None, saturation=.75, fill=True,
+    inner="box", split=False, width=.8, dodge="auto", gap=0,
+    linewidth=None, linecolor=None, cut=2, gridsize=100,
+    bw_method="scott", bw_adjust=1, density_norm="area", common_norm=False,
+    hue_norm=None, formatter=None, native_scale=False, legend="auto",
+    scale=deprecated, scale_hue=deprecated, bw=deprecated,
+    inner_kws=None, ax=None, **kwargs,
 ):
 
-    plotter = _ViolinPlotter(x, y, hue, data, order, hue_order,
-                             bw, cut, scale, scale_hue, gridsize,
-                             width, inner, split, dodge, orient, linewidth,
-                             color, palette, saturation)
+    p = _CategoricalPlotterNew(
+        data=data,
+        variables=_CategoricalPlotterNew.get_semantics(locals()),
+        order=order,
+        orient=orient,
+        require_numeric=False,
+        legend=legend,
+    )
 
     if ax is None:
         ax = plt.gca()
 
-    plotter.plot(ax)
+    if p.plot_data.empty:
+        return ax
+
+    if dodge == "auto":
+        # Needs to be before scale_categorical changes the coordinate series dtype
+        dodge = p._dodge_needed()
+
+    if p.var_types.get(p.orient) == "categorical" or not native_scale:
+        p.scale_categorical(p.orient, order=order, formatter=formatter)
+
+    p._attach(ax)
+
+    # Deprecations to remove in v0.14.0.
+    hue_order = p._palette_without_hue_backcompat(palette, hue_order)
+    palette, hue_order = p._hue_backcompat(color, palette, hue_order)
+
+    saturation = saturation if fill else 1
+    p.map_hue(palette=palette, order=hue_order, norm=hue_norm, saturation=saturation)
+    color = _default_color(
+        ax.fill_between, hue, color,
+        {k: v for k, v in kwargs.items() if k in ["c", "color", "fc", "facecolor"]},
+        saturation=saturation,
+    )
+
+    density_norm, common_norm = p._scale_backcompat(
+        scale, scale_hue, density_norm, common_norm,
+    )
+
+    if bw is not deprecated:
+        msg = dedent(f"""\n
+        The `bw` parameter is deprecated in favor of `bw_method` and `bw_adjust`.
+        Setting `bw_method={bw!r}`, but please see the docs for the new parameters
+        and update your code. This will become an error in seaborn v0.15.0.
+        """)
+        warnings.warn(msg, FutureWarning, stacklevel=2)
+        bw_method = bw
+
+    kde_kws = dict(cut=cut, gridsize=gridsize, bw_method=bw_method, bw_adjust=bw_adjust)
+    inner_kws = {} if inner_kws is None else inner_kws.copy()
+
+    p.plot_violins(
+        width=width,
+        dodge=dodge,
+        gap=gap,
+        split=split,
+        color=color,
+        fill=fill,
+        linecolor=linecolor,
+        linewidth=linewidth,
+        inner=inner,
+        density_norm=density_norm,
+        common_norm=common_norm,
+        kde_kws=kde_kws,
+        inner_kws=inner_kws,
+        plot_kws=kwargs,
+    )
+
+    p._add_axis_labels(ax)
+    p._adjust_cat_axis(ax, axis=p.orient)
+
     return ax
 
 
 violinplot.__doc__ = dedent("""\
-    Draw a combination of boxplot and kernel density estimate.
+    Draw a patch representing a KDE and add observations or box plot statistics.
 
-    A violin plot plays a similar role as a box and whisker plot. It shows the
-    distribution of quantitative data across several levels of one (or more)
-    categorical variables such that those distributions can be compared. Unlike
-    a box plot, in which all of the plot components correspond to actual
-    datapoints, the violin plot features a kernel density estimation of the
-    underlying distribution.
+    A violin plot plays a similar role as a box-and-whisker plot. It shows the
+    distribution of data points after grouping by one (or more) variables.
+    Unlike a box plot, each violin is drawn using a kernel density estimate
+    of the underlying distribution.
 
-    This can be an effective and attractive way to show multiple distributions
-    of data at once, but keep in mind that the estimation procedure is
-    influenced by the sample size, and violins for relatively small samples
-    might look misleadingly smooth.
-
-    {categorical_narrative}
+    {new_categorical_narrative}
 
     Parameters
     ----------
     {categorical_data}
     {input_params}
     {order_vars}
-    bw : {{'scott', 'silverman', float}}, optional
-        Either the name of a reference rule or the scale factor to use when
-        computing the kernel bandwidth. The actual kernel size will be
-        determined by multiplying the scale factor by the standard deviation of
-        the data within each bin.
-    cut : float, optional
-        Distance, in units of bandwidth size, to extend the density past the
-        extreme datapoints. Set to 0 to limit the violin range within the range
-        of the observed data (i.e., to have the same effect as ``trim=True`` in
-        ``ggplot``.
-    scale : {{"area", "count", "width"}}, optional
-        The method used to scale the width of each violin. If ``area``, each
-        violin will have the same area. If ``count``, the width of the violins
-        will be scaled by the number of observations in that bin. If ``width``,
-        each violin will have the same width.
-    scale_hue : bool, optional
-        When nesting violins using a ``hue`` variable, this parameter
-        determines whether the scaling is computed within each level of the
-        major grouping variable (``scale_hue=True``) or across all the violins
-        on the plot (``scale_hue=False``).
-    gridsize : int, optional
-        Number of points in the discrete grid used to compute the kernel
-        density estimate.
-    {width}
-    inner : {{"box", "quartile", "point", "stick", None}}, optional
-        Representation of the datapoints in the violin interior. If ``box``,
-        draw a miniature boxplot. If ``quartiles``, draw the quartiles of the
-        distribution.  If ``point`` or ``stick``, show each underlying
-        datapoint. Using ``None`` will draw unadorned violins.
-    split : bool, optional
-        When using hue nesting with a variable that takes two levels, setting
-        ``split`` to True will draw half of a violin for each level. This can
-        make it easier to directly compare the distributions.
-    {dodge}
     {orient}
-    {linewidth}
     {color}
     {palette}
     {saturation}
+    {fill}
+    inner : {{"box", "quart", "point", "stick", None}}
+        Representation of the data in the violin interior. One of the following:
+
+        - `box`: draw a miniature box-and-whisker plot
+        - `quart`: show the quartiles of the data
+        - `point` or `stick`: show each observation
+    split : bool
+        Show an un-mirrored distribution, alternating sides when using `hue`.
+
+        .. versionchanged:: v0.13.0
+            Previously, this option required a `hue` variable with exactly two levels.
+    {width}
+    {dodge}
+    {gap}
+    {linewidth}
+    {linecolor}
+    cut : float
+        Distance, in units of bandwidth, to extend the density past extreme
+        datapoints. Set to 0 to limit the violin within the data range.
+    gridsize : int
+        Number of points in the discrete grid used to evaluate the KDE.
+    bw_method : {{"scott", "silverman", float}}
+        Either the name of a reference rule or the scale factor to use when
+        computing the kernel bandwidth. The actual kernel size will be
+        determined by multiplying the scale factor by the standard deviation of
+        the data within each group.
+
+        .. versionadded:: v0.13.0
+    bw_adjust: float
+        Factor that scales the bandwidth to use more or less smoothing.
+
+        .. versionadded:: v0.13.0
+    density_norm : {{"area", "count", "width"}}
+        Method that normalizes each density to determine the violin's width.
+        If `area`, each violin will have the same area. If `count`, the width
+        will be proportional to the number of observations. If `width`, each
+        violin will have the same width.
+
+        .. versionadded:: v0.13.0
+    common_norm : bool
+        When `True`, normalize the density across all violins.
+
+        .. versionadded:: v0.13.0
+    {hue_norm}
+    {formatter}
+    {native_scale}
+    {legend}
+    scale : {{"area", "count", "width"}}
+        .. deprecated:: v0.13.0
+            See `density_norm`.
+    scale_hue : bool
+        .. deprecated:: v0.13.0
+            See `common_norm`.
+    bw : {{'scott', 'silverman', float}}
+        .. deprecated:: v0.13.0
+            See `bw_method` and `bw_adjust`.
+    inner_kws : dict of key, value mappings
+        Keyword arguments for the "inner" plot, passed to one of:
+
+        - :class:`matplotlib.collections.LineCollection` (with `inner="stick"`)
+        - :meth:`matplotlib.axes.Axes.scatter` (with `inner="point"`)
+        - :meth:`matplotlib.axes.Axes.plot` (with `inner="quart"` or `kind="box"`)
+
+        Additionally, with `inner="box"`, the keywords `box_width`, `whis_width`,
+        and `marker` receive special handling for the components of the "box" plot.
+
+        .. versionadded:: v0.13.0
     {ax_in}
+    kwargs : key, value mappings
+        Keyword arguments for the violin patches, passsed through to
+        :meth:`matplotlib.axes.Axes.fill_between`.
 
     Returns
     -------
@@ -2389,7 +2387,6 @@ violinplot.__doc__ = dedent("""\
 
     Examples
     --------
-
     .. include:: ../docstrings/violinplot.rst
 
     """).format(**_categorical_docs)
@@ -2445,31 +2442,31 @@ boxenplot.__doc__ = dedent("""\
         All methods are detailed in Wickham's paper. Each makes different
         assumptions about the number of outliers and leverages different
         statistical properties. If "proportion", draw no more than
-        `outlier_prop` extreme observations. If "full", draw `log(n)+1` boxes.
+        `outlier_prop` extreme observations. If "full", draw `log(n) +1` boxes.
     {linewidth}
-    scale : {{"exponential", "linear", "area"}}, optional
+    scale : {{"exponential", "linear", "area"}}
         Method to use for the width of the letter value boxes. All give similar
         results visually. "linear" reduces the width by a constant linear
         factor, "exponential" uses the proportion of data not covered, "area"
         is proportional to the percentage of data covered.
-    outlier_prop : float, optional
+    outlier_prop : float
         Proportion of data believed to be outliers. Must be in the range
         (0, 1]. Used to determine the number of boxes to plot when
         `k_depth="proportion"`.
-    trust_alpha : float, optional
+    trust_alpha : float
         Confidence level for a box to be plotted. Used to determine the
         number of boxes to plot when `k_depth="trustworthy"`. Must be in the
         range (0, 1).
-    showfliers : bool, optional
+    showfliers : bool
         If False, suppress the plotting of outliers.
     {ax_in}
-    box_kws: dict, optional
+    box_kws: dict
         Keyword arguments for the box artists; passed to
         :class:`matplotlib.patches.Rectangle`.
-    line_kws: dict, optional
+    line_kws: dict
         Keyword arguments for the line denoting the median; passed to
         :meth:`matplotlib.axes.Axes.plot`.
-    flier_kws: dict, optional
+    flier_kws: dict
         Keyword arguments for the scatter denoting the outlier observations;
         passed to :meth:`matplotlib.axes.Axes.scatter`.
 
@@ -2511,11 +2508,15 @@ def stripplot(
     if ax is None:
         ax = plt.gca()
 
-    if p.var_types.get(p.cat_axis) == "categorical" or not native_scale:
-        p.scale_categorical(p.cat_axis, order=order, formatter=formatter)
+    if p.plot_data.empty:
+        return ax
+
+    if p.var_types.get(p.orient) == "categorical" or not native_scale:
+        p.scale_categorical(p.orient, order=order, formatter=formatter)
 
     p._attach(ax)
 
+    # Deprecations to remove in v0.14.0.
     hue_order = p._palette_without_hue_backcompat(palette, hue_order)
     palette, hue_order = p._hue_backcompat(color, palette, hue_order)
 
@@ -2527,10 +2528,10 @@ def stripplot(
     kwargs.setdefault("zorder", 3)
     size = kwargs.get("s", size)
 
-    kwargs.update(dict(
+    kwargs.update(
         s=size ** 2,
         edgecolor=edgecolor,
-        linewidth=linewidth)
+        linewidth=linewidth,
     )
 
     p.plot_strips(
@@ -2545,7 +2546,7 @@ def stripplot(
     # but maybe it's better out here? Alternatively, we have an open issue
     # suggesting that _attach could add default axes labels, which seems smart.
     p._add_axis_labels(ax)
-    p._adjust_cat_axis(ax, axis=p.cat_axis)
+    p._adjust_cat_axis(ax, axis=p.orient)
 
     return ax
 
@@ -2561,16 +2562,16 @@ stripplot.__doc__ = dedent("""\
 
     Parameters
     ----------
-    {input_params}
     {categorical_data}
+    {input_params}
     {order_vars}
-    jitter : float, ``True``/``1`` is special-cased, optional
+    jitter : float, ``True``/``1`` is special-cased
         Amount of jitter (only along the categorical axis) to apply. This
         can be useful when you have many points and they overlap, so that
         it is easier to see the distribution. You can specify the amount
         of jitter (half the width of the uniform random variable support),
         or just use ``True`` for a good default.
-    dodge : bool, optional
+    dodge : bool
         When using ``hue`` nesting, setting this to ``True`` will separate
         the strips for different hue levels along the categorical axis.
         Otherwise, the points for each level will be plotted on top of
@@ -2578,13 +2579,15 @@ stripplot.__doc__ = dedent("""\
     {orient}
     {color}
     {palette}
-    size : float, optional
+    size : float
         Radius of the markers, in points.
-    edgecolor : matplotlib color, "gray" is special-cased, optional
+    edgecolor : matplotlib color, "gray" is special-cased
         Color of the lines around each point. If you pass ``"gray"``, the
         brightness is determined by the color palette used for the body
-        of the points.
+        of the points. Note that `stripplot` has `linewidth=0` by default,
+        so edge colors are only visible with nonzero line width.
     {linewidth}
+    {hue_norm}
     {native_scale}
     {formatter}
     {legend}
@@ -2632,14 +2635,18 @@ def swarmplot(
     if ax is None:
         ax = plt.gca()
 
-    if p.var_types.get(p.cat_axis) == "categorical" or not native_scale:
-        p.scale_categorical(p.cat_axis, order=order, formatter=formatter)
+    if p.plot_data.empty:
+        return ax
+
+    if p.var_types.get(p.orient) == "categorical" or not native_scale:
+        p.scale_categorical(p.orient, order=order, formatter=formatter)
 
     p._attach(ax)
 
     if not p.has_xy_data:
         return ax
 
+    # Deprecations to remove in v0.14.0.
     hue_order = p._palette_without_hue_backcompat(palette, hue_order)
     palette, hue_order = p._hue_backcompat(color, palette, hue_order)
 
@@ -2668,7 +2675,7 @@ def swarmplot(
     )
 
     p._add_axis_labels(ax)
-    p._adjust_cat_axis(ax, axis=p.cat_axis)
+    p._adjust_cat_axis(ax, axis=p.orient)
 
     return ax
 
@@ -2693,16 +2700,16 @@ swarmplot.__doc__ = dedent("""\
     {categorical_data}
     {input_params}
     {order_vars}
-    dodge : bool, optional
+    dodge : bool
         When using ``hue`` nesting, setting this to ``True`` will separate
         the strips for different hue levels along the categorical axis.
         Otherwise, the points for each level will be plotted in one swarm.
     {orient}
     {color}
     {palette}
-    size : float, optional
+    size : float
         Radius of the markers, in points.
-    edgecolor : matplotlib color, "gray" is special-cased, optional
+    edgecolor : matplotlib color, "gray" is special-cased
         Color of the lines around each point. If you pass ``"gray"``, the
         brightness is determined by the color palette used for the body
         of the points.
@@ -2737,10 +2744,10 @@ swarmplot.__doc__ = dedent("""\
 def barplot(
     data=None, *, x=None, y=None, hue=None, order=None, hue_order=None,
     estimator="mean", errorbar=("ci", 95), n_boot=1000, units=None, seed=None,
-    orient=None, color=None, palette=None, saturation=.75, width=.8,
-    errcolor=".26", errwidth=None, capsize=None, dodge=True, ci="deprecated",
-    ax=None,
-    **kwargs,
+    orient=None, color=None, palette=None, saturation=.75, fill=True, hue_norm=None,
+    width=.8, dodge="auto", gap=0, native_scale=False, formatter=None, legend="auto",
+    capsize=0, err_kws=None, ci=deprecated, errcolor=deprecated, errwidth=deprecated,
+    ax=None, **kwargs,
 ):
 
     errorbar = utils._deprecate_ci(errorbar, ci)
@@ -2750,39 +2757,72 @@ def barplot(
     if estimator is len:
         estimator = "size"
 
-    plotter = _BarPlotter(x, y, hue, data, order, hue_order,
-                          estimator, errorbar, n_boot, units, seed,
-                          orient, color, palette, saturation,
-                          width, errcolor, errwidth, capsize, dodge)
+    p = _CategoricalAggPlotter(
+        data=data,
+        variables=_CategoricalAggPlotter.get_semantics(locals()),
+        order=order,
+        orient=orient,
+        require_numeric=False,
+        legend=legend,
+    )
 
     if ax is None:
         ax = plt.gca()
 
-    plotter.plot(ax, kwargs)
+    if p.plot_data.empty:
+        return ax
+
+    if dodge == "auto":
+        # Needs to be before scale_categorical changes the coordinate series dtype
+        dodge = p._dodge_needed()
+
+    if p.var_types.get(p.orient) == "categorical" or not native_scale:
+        p.scale_categorical(p.orient, order=order, formatter=formatter)
+
+    p._attach(ax)
+
+    # Deprecations to remove in v0.14.0.
+    hue_order = p._palette_without_hue_backcompat(palette, hue_order)
+    palette, hue_order = p._hue_backcompat(color, palette, hue_order)
+
+    saturation = saturation if fill else 1
+    p.map_hue(palette=palette, order=hue_order, norm=hue_norm, saturation=saturation)
+    color = _default_color(ax.bar, hue, color, kwargs, saturation=saturation)
+
+    aggregator = EstimateAggregator(estimator, errorbar, n_boot=n_boot, seed=seed)
+    err_kws = {} if err_kws is None else _normalize_kwargs(err_kws, mpl.lines.Line2D)
+
+    # Deprecations to remove in v0.15.0.
+    err_kws, capsize = p._err_kws_backcompat(err_kws, errcolor, errwidth, capsize)
+
+    p.plot_bars(
+        aggregator=aggregator,
+        dodge=dodge,
+        width=width,
+        gap=gap,
+        color=color,
+        fill=fill,
+        capsize=capsize,
+        err_kws=err_kws,
+        plot_kws=kwargs,
+    )
+
+    p._add_axis_labels(ax)
+    p._adjust_cat_axis(ax, axis=p.orient)
+
     return ax
 
 
 barplot.__doc__ = dedent("""\
     Show point estimates and errors as rectangular bars.
 
-    A bar plot represents an estimate of central tendency for a numeric
-    variable with the height of each rectangle and provides some indication of
-    the uncertainty around that estimate using error bars. Bar plots include 0
-    in the quantitative axis range, and they are a good choice when 0 is a
-    meaningful value for the quantitative variable, and you want to make
-    comparisons against it.
+    A bar plot represents an aggregate or statistical estimate for a numeric
+    variable with the height of each rectangle and indicates the uncertainty
+    around that estimate using an error bar. Bar plots include 0 in the
+    axis range, and they are a good choice when 0 is a meaningful value
+    for the variable to take.
 
-    For datasets where 0 is not a meaningful value, a point plot will allow you
-    to focus on differences between levels of one or more categorical
-    variables.
-
-    It is also important to keep in mind that a bar plot shows only the mean
-    (or other estimator) value, but in many cases it may be more informative to
-    show the distribution of values at each level of the categorical variables.
-    In that case, other approaches such as a box or violin plot may be more
-    appropriate.
-
-    {categorical_narrative}
+    {new_categorical_narrative}
 
     Parameters
     ----------
@@ -2794,16 +2834,22 @@ barplot.__doc__ = dedent("""\
     {color}
     {palette}
     {saturation}
+    {fill}
+    {hue_norm}
     {width}
-    errcolor : matplotlib color
-        Color used for the error bar lines.
-    {errwidth}
-    {capsize}
     {dodge}
+    {gap}
+    {native_scale}
+    {formatter}
+    {legend}
+    {capsize}
+    {err_kws}
+    {ci}
+    {errcolor}
+    {errwidth}
     {ax_in}
     kwargs : key, value mappings
-        Other keyword arguments are passed through to
-        :meth:`matplotlib.axes.Axes.bar`.
+        Other parameters are passed through to :class:`matplotlib.patches.Rectangle`.
 
     Returns
     -------
@@ -2815,11 +2861,22 @@ barplot.__doc__ = dedent("""\
     {pointplot}
     {catplot}
 
+    Notes
+    -----
+
+    For datasets where 0 is not a meaningful value, a :func:`pointplot` will
+    allow you to focus on differences between levels of one or more categorical
+    variables.
+
+    It is also important to keep in mind that a bar plot shows only the mean (or
+    other aggregate) value, but it is often more informative to show the
+    distribution of values at each level of the categorical variables. In those
+    cases, approaches such as a :func:`boxplot` or :func:`violinplot` may be
+    more appropriate.
+
     Examples
     --------
-
     .. include:: ../docstrings/barplot.rst
-
 
     """).format(**_categorical_docs)
 
@@ -2827,27 +2884,69 @@ barplot.__doc__ = dedent("""\
 def pointplot(
     data=None, *, x=None, y=None, hue=None, order=None, hue_order=None,
     estimator="mean", errorbar=("ci", 95), n_boot=1000, units=None, seed=None,
-    markers="o", linestyles="-", dodge=False, join=True, scale=1,
-    orient=None, color=None, palette=None, errwidth=None, ci="deprecated",
-    capsize=None, ax=None,
+    color=None, palette=None, hue_norm=None, markers=default, linestyles=default,
+    dodge=False, native_scale=False, orient=None, capsize=0,
+    formatter=None, legend="auto", err_kws=None,
+    ci=deprecated, errwidth=deprecated, join=deprecated, scale=deprecated,
+    ax=None,
+    **kwargs,
 ):
 
     errorbar = utils._deprecate_ci(errorbar, ci)
 
-    plotter = _PointPlotter(x, y, hue, data, order, hue_order,
-                            estimator, errorbar, n_boot, units, seed,
-                            markers, linestyles, dodge, join, scale,
-                            orient, color, palette, errwidth, capsize)
+    p = _CategoricalAggPlotter(
+        data=data,
+        variables=_CategoricalAggPlotter.get_semantics(locals()),
+        order=order,
+        orient=orient,
+        require_numeric=False,
+        legend=legend,
+    )
 
     if ax is None:
         ax = plt.gca()
 
-    plotter.plot(ax)
+    if p.plot_data.empty:
+        return ax
+
+    if p.var_types.get(p.orient) == "categorical" or not native_scale:
+        p.scale_categorical(p.orient, order=order, formatter=formatter)
+
+    p._attach(ax)
+
+    # Deprecations to remove in v0.14.0.
+    hue_order = p._palette_without_hue_backcompat(palette, hue_order)
+    palette, hue_order = p._hue_backcompat(color, palette, hue_order)
+
+    p.map_hue(palette=palette, order=hue_order, norm=hue_norm)
+    color = _default_color(ax.plot, hue, color, kwargs)
+
+    aggregator = EstimateAggregator(estimator, errorbar, n_boot=n_boot, seed=seed)
+    err_kws = {} if err_kws is None else _normalize_kwargs(err_kws, mpl.lines.Line2D)
+
+    # Deprecations to remove in v0.15.0.
+    p._point_kwargs_backcompat(scale, join, kwargs)
+    err_kws, capsize = p._err_kws_backcompat(err_kws, None, errwidth, capsize)
+
+    p.plot_points(
+        aggregator=aggregator,
+        markers=markers,
+        linestyles=linestyles,
+        dodge=dodge,
+        color=color,
+        capsize=capsize,
+        err_kws=err_kws,
+        plot_kws=kwargs,
+    )
+
+    p._add_axis_labels(ax)
+    p._adjust_cat_axis(ax, axis=p.orient)
+
     return ax
 
 
 pointplot.__doc__ = dedent("""\
-    Show point estimates and errors using dot marks.
+    Show point estimates and errors using lines with markers.
 
     A point plot represents an estimate of central tendency for a numeric
     variable by the position of the dot and provides some indication of the
@@ -2862,13 +2961,7 @@ pointplot.__doc__ = dedent("""\
     easier for the eyes than comparing the heights of several groups of points
     or bars.
 
-    It is important to keep in mind that a point plot shows only the mean (or
-    other estimator) value, but in many cases it may be more informative to
-    show the distribution of values at each level of the categorical variables.
-    In that case, other approaches such as a box or violin plot may be more
-    appropriate.
-
-    {categorical_narrative}
+    {new_categorical_narrative}
 
     Parameters
     ----------
@@ -2876,24 +2969,38 @@ pointplot.__doc__ = dedent("""\
     {input_params}
     {order_vars}
     {stat_api_params}
-    markers : string or list of strings, optional
-        Markers to use for each of the ``hue`` levels.
-    linestyles : string or list of strings, optional
-        Line styles to use for each of the ``hue`` levels.
-    dodge : bool or float, optional
-        Amount to separate the points for each level of the ``hue`` variable
-        along the categorical axis.
-    join : bool, optional
-        If ``True``, lines will be drawn between point estimates at the same
-        ``hue`` level.
-    scale : float, optional
-        Scale factor for the plot elements.
-    {orient}
     {color}
     {palette}
-    {errwidth}
+    markers : string or list of strings
+        Markers to use for each of the `hue` levels.
+    linestyles : string or list of strings
+        Line styles to use for each of the `hue` levels.
+    dodge : bool or float
+        Amount to separate the points for each level of the ``hue`` variable
+        along the categorical axis.
+    {native_scale}
+    {orient}
     {capsize}
+    {formatter}
+    {legend}
+    {err_kws}
+    {ci}
+    {errwidth}
+    join : bool
+        If `True`, draw lines will be drawn between point estimates.
+
+        .. deprecated:: v0.13.0
+            Set `linestyle="none"` to remove the lines between the points.
+    scale : float
+        Scale factor for the plot elements.
+
+        .. deprecated:: v0.13.0
+            Control element sizes with :class:`matplotlib.lines.Line2D` parameters.
     {ax_in}
+    kwargs : key, value mappings
+        Other parameters are passed through to :class:`matplotlib.lines.Line2D`.
+
+        .. versionadded:: v0.13.0
 
     Returns
     -------
@@ -2904,9 +3011,16 @@ pointplot.__doc__ = dedent("""\
     {barplot}
     {catplot}
 
+    Notes
+    -----
+    It is important to keep in mind that a point plot shows only the mean (or
+    other estimator) value, but in many cases it may be more informative to
+    show the distribution of values at each level of the categorical variables.
+    In that case, other approaches such as a box or violin plot may be more
+    appropriate.
+
     Examples
     --------
-
     .. include:: ../docstrings/pointplot.rst
 
     """).format(**_categorical_docs)
@@ -2914,41 +3028,79 @@ pointplot.__doc__ = dedent("""\
 
 def countplot(
     data=None, *, x=None, y=None, hue=None, order=None, hue_order=None,
-    orient=None, color=None, palette=None, saturation=.75, width=.8,
-    dodge=True, ax=None, **kwargs
+    orient=None, color=None, palette=None, saturation=.75, fill=True, hue_norm=None,
+    stat="count", width=.8, dodge="auto", gap=0, native_scale=False, formatter=None,
+    legend="auto", ax=None, **kwargs
 ):
 
-    estimator = "size"
-    errorbar = None
-    n_boot = 0
-    units = None
-    seed = None
-    errcolor = None
-    errwidth = None
-    capsize = None
-
     if x is None and y is not None:
-        orient = "h"
-        x = y
-    elif y is None and x is not None:
-        orient = "v"
-        y = x
+        orient = "y"
+        x = 1
+    elif x is not None and y is None:
+        orient = "x"
+        y = 1
     elif x is not None and y is not None:
-        raise ValueError("Cannot pass values for both `x` and `y`")
+        raise TypeError("Cannot pass values for both `x` and `y`.")
 
-    plotter = _CountPlotter(
-        x, y, hue, data, order, hue_order,
-        estimator, errorbar, n_boot, units, seed,
-        orient, color, palette, saturation,
-        width, errcolor, errwidth, capsize, dodge
+    p = _CategoricalAggPlotter(
+        data=data,
+        variables=_CategoricalAggPlotter.get_semantics(locals()),
+        order=order,
+        orient=orient,
+        require_numeric=False,
+        legend=legend,
     )
-
-    plotter.value_label = "count"
 
     if ax is None:
         ax = plt.gca()
 
-    plotter.plot(ax, kwargs)
+    if p.plot_data.empty:
+        return ax
+
+    if dodge == "auto":
+        # Needs to be before scale_categorical changes the coordinate series dtype
+        dodge = p._dodge_needed()
+
+    if p.var_types.get(p.orient) == "categorical" or not native_scale:
+        p.scale_categorical(p.orient, order=order, formatter=formatter)
+
+    p._attach(ax)
+
+    # Deprecations to remove in v0.14.0.
+    hue_order = p._palette_without_hue_backcompat(palette, hue_order)
+    palette, hue_order = p._hue_backcompat(color, palette, hue_order)
+
+    saturation = saturation if fill else 1
+    p.map_hue(palette=palette, order=hue_order, norm=hue_norm, saturation=saturation)
+    color = _default_color(ax.bar, hue, color, kwargs, saturation)
+
+    count_axis = {"x": "y", "y": "x"}[p.orient]
+    if p.input_format == "wide":
+        p.plot_data[count_axis] = 1
+
+    _check_argument("stat", ["count", "percent", "probability", "proportion"], stat)
+    p.variables[count_axis] = stat
+    if stat != "count":
+        denom = 100 if stat == "percent" else 1
+        p.plot_data[count_axis] /= len(p.plot_data) / denom
+
+    aggregator = EstimateAggregator("sum", errorbar=None)
+
+    p.plot_bars(
+        aggregator=aggregator,
+        dodge=dodge,
+        width=width,
+        gap=gap,
+        color=color,
+        fill=fill,
+        capsize=0,
+        err_kws={},
+        plot_kws=kwargs,
+    )
+
+    p._add_axis_labels(ax)
+    p._adjust_cat_axis(ax, axis=p.orient)
+
     return ax
 
 
@@ -2959,10 +3111,10 @@ countplot.__doc__ = dedent("""\
     of quantitative, variable. The basic API and options are identical to those
     for :func:`barplot`, so you can compare counts across nested variables.
 
-    Note that the newer :func:`histplot` function offers more functionality, although
-    its default behavior is somewhat different.
+    Note that :func:`histplot` function offers similar functionality with additional
+    features (e.g. bar stacking), although its default behavior is somewhat different.
 
-    {categorical_narrative}
+    {new_categorical_narrative}
 
     Parameters
     ----------
@@ -2973,11 +3125,20 @@ countplot.__doc__ = dedent("""\
     {color}
     {palette}
     {saturation}
+    {hue_norm}
+    stat : {{'count', 'percent', 'proportion', 'probability'}}
+        Statistic to compute; when not `'count'`, bar heights will be normalized so that
+        they sum to 100 (for `'percent'`) or 1 (otherwise) across the plot.
+
+        .. versionadded:: v0.13.0
+    {width}
     {dodge}
+    {native_scale}
+    {formatter}
+    {legend}
     {ax_in}
     kwargs : key, value mappings
-        Other keyword arguments are passed through to
-        :meth:`matplotlib.axes.Axes.bar`.
+        Other parameters are passed through to :class:`matplotlib.patches.Rectangle`.
 
     Returns
     -------
@@ -2985,6 +3146,7 @@ countplot.__doc__ = dedent("""\
 
     See Also
     --------
+    histplot : Bin and count observations with additional options.
     {barplot}
     {catplot}
 
@@ -2992,7 +3154,6 @@ countplot.__doc__ = dedent("""\
     --------
 
     .. include:: ../docstrings/countplot.rst
-
     """).format(**_categorical_docs)
 
 
@@ -3021,12 +3182,30 @@ def catplot(
         warnings.warn(msg, UserWarning)
         kwargs.pop("ax")
 
-    refactored_kinds = ["strip", "swarm"]
+    refactored_kinds = ["strip", "swarm", "point", "bar", "count", "box", "violin"]
+    desaturated_kinds = ["bar", "count", "box", "violin"]
+    undodged_kinds = ["strip", "swarm", "point"]
+
     if kind in refactored_kinds:
 
-        p = _CategoricalFacetPlotter(
+        if kind in ["bar", "point", "count"]:
+            Plotter = _CategoricalAggFacetPlotter
+        else:
+            Plotter = _CategoricalFacetPlotter
+
+        if kind == "count":
+            if x is None and y is not None:
+                orient = "y"
+                x = 1
+            elif x is not None and y is None:
+                orient = "x"
+                y = 1
+            elif x is not None and y is not None:
+                raise ValueError("Cannot pass values for both `x` and `y`.")
+
+        p = Plotter(
             data=data,
-            variables=_CategoricalFacetPlotter.get_semantics(locals()),
+            variables=Plotter.get_semantics(locals()),
             order=order,
             orient=orient,
             require_numeric=False,
@@ -3064,33 +3243,46 @@ def catplot(
         # happen or if disabling that is the cleaner solution.
         has_xy_data = p.has_xy_data
 
-        if not native_scale or p.var_types[p.cat_axis] == "categorical":
-            p.scale_categorical(p.cat_axis, order=order, formatter=formatter)
+        if not native_scale or p.var_types[p.orient] == "categorical":
+            p.scale_categorical(p.orient, order=order, formatter=formatter)
 
         p._attach(g)
 
         if not has_xy_data:
             return g
 
+        # Deprecations to remove in v0.14.0.
         hue_order = p._palette_without_hue_backcompat(palette, hue_order)
         palette, hue_order = p._hue_backcompat(color, palette, hue_order)
-        p.map_hue(palette=palette, order=hue_order, norm=hue_norm)
+
+        saturation = kwargs.pop(
+            "saturation",
+            0.75 if kind in desaturated_kinds and kwargs.get("fill", True) else 1
+        )
+        p.map_hue(
+            palette=palette, order=hue_order, norm=hue_norm, saturation=saturation
+        )
 
         # Set a default color
         # Otherwise each artist will be plotted separately and trip the color cycle
-        if hue is None and color is None:
-            color = "C0"
+        if hue is None:
+            color = "C0" if color is None else color
+            if saturation < 1:
+                color = desaturate(color, saturation)
+        edgecolor = kwargs.pop("edgecolor", "gray")  # XXX TODO default
+
+        width = kwargs.pop("width", 0.8)
+        dodge = kwargs.pop("dodge", False if kind in undodged_kinds else "auto")
+        if dodge == "auto":
+            dodge = p._dodge_needed()
 
         if kind == "strip":
 
             # TODO get these defaults programmatically?
             jitter = kwargs.pop("jitter", True)
-            dodge = kwargs.pop("dodge", False)
-            edgecolor = kwargs.pop("edgecolor", "gray")  # XXX TODO default
-
-            plot_kws = kwargs.copy()
 
             # XXX Copying possibly bad default decisions from original code for now
+            plot_kws = kwargs.copy()
             plot_kws.setdefault("zorder", 3)
             plot_kws.setdefault("s", plot_kws.pop("size", 5) ** 2)
             plot_kws.setdefault("linewidth", 0)
@@ -3106,13 +3298,10 @@ def catplot(
         elif kind == "swarm":
 
             # TODO get these defaults programmatically?
-            dodge = kwargs.pop("dodge", False)
-            edgecolor = kwargs.pop("edgecolor", "gray")  # XXX TODO default
             warn_thresh = kwargs.pop("warn_thresh", .05)
 
-            plot_kws = kwargs.copy()
-
             # XXX Copying possibly bad default decisions from original code for now
+            plot_kws = kwargs.copy()
             plot_kws.setdefault("zorder", 3)
             plot_kws.setdefault("s", plot_kws.pop("size", 5) ** 2)
 
@@ -3127,24 +3316,186 @@ def catplot(
                 plot_kws=plot_kws,
             )
 
-        # XXX best way to do this housekeeping?
-        for ax in g.axes.flat:
-            p._adjust_cat_axis(ax, axis=p.cat_axis)
+        elif kind == "box":
 
-        g.set_axis_labels(
-            p.variables.get("x", None),
-            p.variables.get("y", None),
-        )
+            plot_kws = kwargs.copy()
+            gap = plot_kws.pop("gap", 0)
+            fill = plot_kws.pop("fill", True)
+            whis = plot_kws.pop("whis", 1.5)
+            linecolor = plot_kws.pop("linecolor", None)
+            linewidth = plot_kws.pop("linewidth", None)
+            fliersize = plot_kws.pop("fliersize", 5)
+
+            p.plot_boxes(
+                width=width,
+                dodge=dodge,
+                gap=gap,
+                fill=fill,
+                whis=whis,
+                color=color,
+                linecolor=linecolor,
+                linewidth=linewidth,
+                fliersize=fliersize,
+                plot_kws=plot_kws,
+            )
+
+        elif kind == "violin":
+
+            plot_kws = kwargs.copy()
+            gap = plot_kws.pop("gap", 0)
+            fill = plot_kws.pop("fill", True)
+            split = plot_kws.pop("split", False)
+            inner = plot_kws.pop("inner", "box")
+            density_norm = plot_kws.pop("density_norm", "area")
+            common_norm = plot_kws.pop("common_norm", False)
+
+            scale = plot_kws.pop("scale", deprecated)
+            scale_hue = plot_kws.pop("scale_hue", deprecated)
+            density_norm, common_norm = p._scale_backcompat(
+                scale, scale_hue, density_norm, common_norm,
+            )
+
+            kde_kws = dict(
+                cut=plot_kws.pop("cut", 2),
+                gridsize=plot_kws.pop("gridsize", 100),
+                bw_method=plot_kws.pop("bw_method", "scott"),
+                bw_adjust=plot_kws.pop("bw_adjust", 1),
+            )
+            bw = plot_kws.pop("bw", deprecated)
+            msg = dedent(f"""\n
+            The `bw` parameter is deprecated in favor of `bw_method` and `bw_adjust`.
+            Setting `bw_method={bw!r}`, but please see the docs for the new parameters
+            and update your code. This will become an error in seaborn v0.15.0.
+            """)
+            if bw is not deprecated:
+                warnings.warn(msg, FutureWarning, stacklevel=2)
+                kde_kws["bw_method"] = bw
+
+            inner_kws = plot_kws.pop("inner_kws", {}).copy()
+            linecolor = plot_kws.pop("linecolor", None)
+            linewidth = plot_kws.pop("linewidth", None)
+
+            p.plot_violins(
+                width=width,
+                dodge=dodge,
+                gap=gap,
+                split=split,
+                color=color,
+                fill=fill,
+                linecolor=linecolor,
+                linewidth=linewidth,
+                inner=inner,
+                density_norm=density_norm,
+                common_norm=common_norm,
+                kde_kws=kde_kws,
+                inner_kws=inner_kws,
+                plot_kws=plot_kws,
+            )
+
+        elif kind == "point":
+
+            aggregator = EstimateAggregator(
+                estimator, errorbar, n_boot=n_boot, seed=seed
+            )
+
+            markers = kwargs.pop("markers", default)
+            linestyles = kwargs.pop("linestyles", default)
+
+            # Deprecations to remove in v0.15.0.
+            # TODO Uncomment when removing deprecation backcompat
+            # capsize = kwargs.pop("capsize", 0)
+            # err_kws = _normalize_kwargs(kwargs.pop("err_kws", {}), mpl.lines.Line2D)
+            p._point_kwargs_backcompat(
+                kwargs.pop("scale", deprecated),
+                kwargs.pop("join", deprecated),
+                kwargs
+            )
+            err_kws, capsize = p._err_kws_backcompat(
+                _normalize_kwargs(kwargs.pop("err_kws", {}), mpl.lines.Line2D),
+                None,
+                errwidth=kwargs.pop("errwidth", deprecated),
+                capsize=kwargs.pop("capsize", 0),
+            )
+
+            p.plot_points(
+                aggregator=aggregator,
+                markers=markers,
+                linestyles=linestyles,
+                dodge=dodge,
+                color=color,
+                capsize=capsize,
+                err_kws=err_kws,
+                plot_kws=kwargs,
+            )
+
+        elif kind == "bar":
+
+            aggregator = EstimateAggregator(
+                estimator, errorbar, n_boot=n_boot, seed=seed
+            )
+            err_kws, capsize = p._err_kws_backcompat(
+                _normalize_kwargs(kwargs.pop("err_kws", {}), mpl.lines.Line2D),
+                errcolor=kwargs.pop("errcolor", deprecated),
+                errwidth=kwargs.pop("errwidth", deprecated),
+                capsize=kwargs.pop("capsize", 0),
+            )
+            gap = kwargs.pop("gap", 0)
+            fill = kwargs.pop("fill", True)
+
+            p.plot_bars(
+                aggregator=aggregator,
+                dodge=dodge,
+                width=width,
+                gap=gap,
+                color=color,
+                fill=fill,
+                capsize=capsize,
+                err_kws=err_kws,
+                plot_kws=kwargs,
+            )
+
+        elif kind == "count":
+
+            aggregator = EstimateAggregator("sum", errorbar=None)
+
+            count_axis = {"x": "y", "y": "x"}[p.orient]
+            p.plot_data[count_axis] = 1
+
+            stat_options = ["count", "percent", "probability", "proportion"]
+            stat = _check_argument("stat", stat_options, kwargs.pop("stat", "count"))
+            p.variables[count_axis] = stat
+            if stat != "count":
+                denom = 100 if stat == "percent" else 1
+                p.plot_data[count_axis] /= len(p.plot_data) / denom
+
+            gap = kwargs.pop("gap", 0)
+            fill = kwargs.pop("fill", True)
+
+            p.plot_bars(
+                aggregator=aggregator,
+                dodge=dodge,
+                width=width,
+                gap=gap,
+                color=color,
+                fill=fill,
+                capsize=0,
+                err_kws={},
+                plot_kws=kwargs,
+            )
+
+        for ax in g.axes.flat:
+            p._adjust_cat_axis(ax, axis=p.orient)
+
+        g.set_axis_labels(p.variables.get("x"), p.variables.get("y"))
         g.set_titles()
         g.tight_layout()
 
-        # XXX Hack to get the legend data in the right place
         for ax in g.axes.flat:
             g._update_legend_data(ax)
             ax.legend_ = None
 
-        if legend and (hue is not None) and (hue not in [x, row, col]):
-            g.add_legend(title=hue, label_order=hue_order)
+        if legend and "hue" in p.variables:
+            g.add_legend(title=p.variables.get("hue"), label_order=hue_order)
 
         return g
 
@@ -3160,9 +3511,9 @@ def catplot(
     # correctly in the case of a count plot
     if kind == "count":
         if x is None and y is not None:
-            x_, y_, orient = y, y, "h"
+            x_, y_, orient = y, y, "y"
         elif y is None and x is not None:
-            x_, y_, orient = x, x, "v"
+            x_, y_, orient = x, x, "x"
         else:
             raise ValueError("Either `x` or `y` must be None for kind='count'")
     else:
@@ -3170,21 +3521,14 @@ def catplot(
 
     # Determine the order for the whole dataset, which will be used in all
     # facets to ensure representation of all data in the final plot
-    plotter_class = {
-        "box": _BoxPlotter,
-        "violin": _ViolinPlotter,
-        "boxen": _LVPlotter,
-        "bar": _BarPlotter,
-        "point": _PointPlotter,
-        "count": _CountPlotter,
-    }[kind]
+    plotter_class = {"boxen": _LVPlotter}[kind]
     p = _CategoricalPlotter()
     p.require_numeric = plotter_class.require_numeric
     p.establish_variables(x_, y_, hue, data, orient, order, hue_order)
     if (
         order is not None
-        or (sharex and p.orient == "v")
-        or (sharey and p.orient == "h")
+        or (sharex and p.orient == "x")
+        or (sharey and p.orient == "y")
     ):
         # Sync categorical axis between facets to have the same categories
         order = p.group_names
@@ -3193,9 +3537,9 @@ def catplot(
             "Setting `{}=False` with `color=None` may cause different levels of the "
             "`{}` variable to share colors. This will change in a future version."
         )
-        if not sharex and p.orient == "v":
+        if not sharex and p.orient == "x":
             warnings.warn(msg.format("sharex", "x"), UserWarning)
-        if not sharey and p.orient == "h":
+        if not sharey and p.orient == "y":
             warnings.warn(msg.format("sharey", "y"), UserWarning)
 
     hue_order = p.hue_names
@@ -3226,30 +3570,18 @@ def catplot(
     )
     plot_kws.update(kwargs)
 
-    if kind in ["bar", "point"]:
-        errorbar = utils._deprecate_ci(errorbar, ci)
-        plot_kws.update(
-            estimator=estimator, errorbar=errorbar,
-            n_boot=n_boot, units=units, seed=seed,
-        )
-
     # Initialize the facets
     g = FacetGrid(**facet_kws)
 
     # Draw the plot onto the facets
+    if not plot_kws.get("order"):
+        plot_kws.pop("order", None)
     g.map_dataframe(plot_func, x=x, y=y, hue=hue, **plot_kws)
 
-    if p.orient == "h":
+    if p.orient == "y":
         g.set_axis_labels(p.value_label, p.group_label)
     else:
         g.set_axis_labels(p.group_label, p.value_label)
-
-    # Special case axis labels for a count type plot
-    if kind == "count":
-        if x is None:
-            g.set_axis_labels(x_var="count")
-        if y is None:
-            g.set_axis_labels(y_var="count")
 
     if legend and (hue is not None) and (hue not in [x, row, col]):
         hue_order = list(map(utils.to_utf8, hue_order))
@@ -3299,17 +3631,17 @@ catplot.__doc__ = dedent("""\
     ----------
     {long_form_data}
     {string_input_params}
-    row, col : names of variables in `data`, optional
+    row, col : names of variables in `data`
         Categorical variables that will determine the faceting of the grid.
     {col_wrap}
     {stat_api_params}
     {order_vars}
-    row_order, col_order : lists of strings, optional
+    row_order, col_order : lists of strings
         Order to organize the rows and/or columns of the grid in, otherwise the
         orders are inferred from the data objects.
     {height}
     {aspect}
-    kind : str, optional
+    kind : str
         The kind of plot to draw, corresponds to the name of a categorical
         axes-level plotting function. Options are: "strip", "swarm", "box", "violin",
         "boxen", "point", "bar", or "count".
@@ -3319,13 +3651,13 @@ catplot.__doc__ = dedent("""\
     {color}
     {palette}
     {hue_norm}
-    legend : str or bool, optional
+    legend : str or bool
         Set to `False` to disable the legend. With `strip` or `swarm` plots,
         this also accepts a string, as described in the axes-level docstrings.
     {legend_out}
     {share_xy}
     {margin_titles}
-    facet_kws : dict, optional
+    facet_kws : dict
         Dictionary of other keyword arguments to pass to :class:`FacetGrid`.
     kwargs : key, value pairings
         Other keyword arguments are passed through to the underlying plotting
@@ -3347,9 +3679,7 @@ catplot.__doc__ = dedent("""\
 
 class Beeswarm:
     """Modifies a scatterplot artist to show a beeswarm plot."""
-    def __init__(self, orient="v", width=0.8, warn_thresh=.05):
-
-        # XXX should we keep the orient parameterization or specify the swarm axis?
+    def __init__(self, orient="x", width=0.8, warn_thresh=.05):
 
         self.orient = orient
         self.width = width
@@ -3366,7 +3696,7 @@ class Beeswarm:
         orig_xy_data = points.get_offsets()
 
         # Reset the categorical positions to the center line
-        cat_idx = 1 if self.orient == "h" else 0
+        cat_idx = 1 if self.orient == "y" else 0
         orig_xy_data[:, cat_idx] = center
 
         # Transform the data coordinates to point coordinates.
@@ -3376,7 +3706,7 @@ class Beeswarm:
         orig_xy = ax.transData.transform(orig_xy_data)
 
         # Order the variables so that x is the categorical axis
-        if self.orient == "h":
+        if self.orient == "y":
             orig_xy = orig_xy[:, [1, 0]]
 
         # Add a column with each point's radius
@@ -3396,23 +3726,22 @@ class Beeswarm:
         new_xyr[sorter] = self.beeswarm(orig_xyr)
 
         # Transform the point coordinates back to data coordinates
-        if self.orient == "h":
+        if self.orient == "y":
             new_xy = new_xyr[:, [1, 0]]
         else:
             new_xy = new_xyr[:, :2]
         new_x_data, new_y_data = ax.transData.inverted().transform(new_xy).T
 
-        swarm_axis = {"h": "y", "v": "x"}[self.orient]
-        log_scale = getattr(ax, f"get_{swarm_axis}scale")() == "log"
+        log_scale = getattr(ax, f"get_{self.orient}scale")() == "log"
 
         # Add gutters
-        if self.orient == "h":
+        if self.orient == "y":
             self.add_gutters(new_y_data, center, log_scale=log_scale)
         else:
             self.add_gutters(new_x_data, center, log_scale=log_scale)
 
         # Reposition the points so they do not overlap
-        if self.orient == "h":
+        if self.orient == "y":
             points.set_offsets(np.c_[orig_x_data, new_y_data])
         else:
             points.set_offsets(np.c_[new_x_data, orig_y_data])
@@ -3540,3 +3869,58 @@ class Beeswarm:
             warnings.warn(msg, UserWarning)
 
         return points
+
+
+BoxPlotArtists = namedtuple("BoxPlotArtists", "box median whiskers caps fliers mean")
+
+
+class BoxPlotContainer:
+
+    def __init__(self, artist_dict):
+
+        self.boxes = artist_dict["boxes"]
+        self.medians = artist_dict["medians"]
+        self.whiskers = artist_dict["whiskers"]
+        self.caps = artist_dict["caps"]
+        self.fliers = artist_dict["fliers"]
+        self.means = artist_dict["means"]
+
+        self._label = None
+        self._children = [
+            *self.boxes,
+            *self.medians,
+            *self.whiskers,
+            *self.caps,
+            *self.fliers,
+            *self.means,
+        ]
+
+    def __repr__(self):
+        return f"<BoxPlotContainer object with {len(self.boxes)} boxes>"
+
+    def __getitem__(self, idx):
+        pair_slice = slice(2 * idx, 2 * idx + 2)
+        return BoxPlotArtists(
+            self.boxes[idx] if self.boxes else [],
+            self.medians[idx] if self.medians else [],
+            self.whiskers[pair_slice] if self.whiskers else [],
+            self.caps[pair_slice] if self.caps else [],
+            self.fliers[idx] if self.fliers else [],
+            self.means[idx]if self.means else [],
+        )
+
+    def __iter__(self):
+        yield from (self[i] for i in range(len(self.boxes)))
+
+    def get_label(self):
+        return self._label
+
+    def set_label(self, value):
+        self._label = value
+
+    def get_children(self):
+        return self._children
+
+    def remove(self):
+        for child in self._children:
+            child.remove()

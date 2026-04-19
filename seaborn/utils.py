@@ -1,11 +1,11 @@
 """Utility functions, mostly for internal use."""
 import os
-import re
 import inspect
 import warnings
 import colorsys
 from contextlib import contextmanager
 from urllib.request import urlopen, urlretrieve
+from types import ModuleType
 
 import numpy as np
 import pandas as pd
@@ -14,11 +14,15 @@ from matplotlib.colors import to_rgb
 import matplotlib.pyplot as plt
 from matplotlib.cbook import normalize_kwargs
 
-from .external.version import Version
-from .external.appdirs import user_cache_dir
+from seaborn._core.typing import deprecated
+from seaborn.external.version import Version
+from seaborn.external.appdirs import user_cache_dir
 
 __all__ = ["desaturate", "saturate", "set_hls_values", "move_legend",
            "despine", "get_dataset_names", "get_data_home", "load_dataset"]
+
+DATASET_SOURCE = "https://raw.githubusercontent.com/mwaskom/seaborn-data/master"
+DATASET_NAMES_URL = f"{DATASET_SOURCE}/dataset_names.txt"
 
 
 def ci_to_errsize(cis, heights):
@@ -85,8 +89,9 @@ def _draw_figure(fig):
             pass
 
 
-def _default_color(method, hue, color, kws):
+def _default_color(method, hue, color, kws, saturation=1):
     """If needed, get a default color by using the matplotlib property cycle."""
+
     if hue is not None:
         # This warning is probably user-friendly, but it's currently triggered
         # in a FacetGrid context and I don't want to mess with that logic right now
@@ -95,12 +100,18 @@ def _default_color(method, hue, color, kws):
         #      warnings.warn(msg)
         return None
 
+    kws = kws.copy()
+    kws.pop("label", None)
+
     if color is not None:
+        if saturation < 1:
+            color = desaturate(color, saturation)
         return color
 
     elif method.__name__ == "plot":
 
-        scout, = method([], [], scalex=False, scaley=False, **kws)
+        color = _normalize_kwargs(kws, mpl.lines.Line2D).get("color")
+        scout, = method([], [], scalex=False, scaley=False, color=color)
         color = scout.get_color()
         scout.remove()
 
@@ -139,27 +150,19 @@ def _default_color(method, hue, color, kws):
         scout, = method([np.nan], [np.nan], **kws)
         color = to_rgb(scout.get_facecolor())
         scout.remove()
+        # Axes.bar adds both a patch and a container
+        method.__self__.containers.pop(-1)
 
     elif method.__name__ == "fill_between":
 
-        # There is a bug on matplotlib < 3.3 where fill_between with
-        # datetime units and empty data will set incorrect autoscale limits
-        # To workaround it, we'll always return the first color in the cycle.
-        # https://github.com/matplotlib/matplotlib/issues/17586
-        ax = method.__self__
-        datetime_axis = any([
-            isinstance(ax.xaxis.converter, mpl.dates.DateConverter),
-            isinstance(ax.yaxis.converter, mpl.dates.DateConverter),
-        ])
-        if Version(mpl.__version__) < Version("3.3") and datetime_axis:
-            return "C0"
-
         kws = _normalize_kwargs(kws, mpl.collections.PolyCollection)
-
         scout = method([], [], **kws)
         facecolor = scout.get_facecolor()
         color = to_rgb(facecolor[0])
         scout.remove()
+
+    if saturation < 1:
+        color = desaturate(color, saturation)
 
     return color
 
@@ -186,6 +189,10 @@ def desaturate(color, prop):
 
     # Get rgb tuple rep
     rgb = to_rgb(color)
+
+    # Short circuit to avoid floating point issues
+    if prop == 1:
+        return rgb
 
     # Convert to hls
     h, l, s = colorsys.rgb_to_hls(*rgb)
@@ -448,7 +455,9 @@ def move_legend(obj, loc, **kwargs):
         raise ValueError(err)
 
     # Extract the components of the legend we need to reuse
-    handles = old_legend.legendHandles
+    # Import here to avoid a circular import
+    from seaborn._compat import get_legend_handles
+    handles = get_legend_handles(old_legend)
     labels = [t.get_text() for t in old_legend.get_texts()]
 
     # Extract legend properties that can be passed to the recreation method
@@ -503,13 +512,11 @@ def get_dataset_names():
     Requires an internet connection.
 
     """
-    url = "https://github.com/mwaskom/seaborn-data"
-    with urlopen(url) as resp:
-        html = resp.read()
+    with urlopen(DATASET_NAMES_URL) as resp:
+        txt = resp.read()
 
-    pat = r"/mwaskom/seaborn-data/blob/master/(\w*).csv"
-    datasets = re.findall(pat, html.decode())
-    return datasets
+    dataset_names = [name.strip() for name in txt.decode().split("\n")]
+    return list(filter(None, dataset_names))
 
 
 def get_data_home(data_home=None):
@@ -573,7 +580,7 @@ def load_dataset(name, cache=True, data_home=None, **kws):
         )
         raise TypeError(err)
 
-    url = f"https://raw.githubusercontent.com/mwaskom/seaborn-data/master/{name}.csv"
+    url = f"{DATASET_SOURCE}/{name}.csv"
 
     if cache:
         cache_path = os.path.join(get_data_home(data_home), os.path.basename(url))
@@ -694,6 +701,10 @@ def locator_to_legend_entries(locator, limits, dtype):
         formatter = mpl.ticker.LogFormatter()
     else:
         formatter = mpl.ticker.ScalarFormatter()
+        # Avoid having an offset/scientific notation which we don't currently
+        # have any way of representing in the legend
+        formatter.set_useOffset(False)
+        formatter.set_scientific(False)
     formatter.axis = dummy_axis()
 
     # TODO: The following two lines should be replaced
@@ -776,12 +787,18 @@ def _normalize_kwargs(kws, artist):
     return kws
 
 
-def _check_argument(param, options, value):
+def _check_argument(param, options, value, prefix=False):
     """Raise if value for param is not in options."""
-    if value not in options:
+    if prefix and value is not None:
+        failure = not any(value.startswith(p) for p in options if isinstance(p, str))
+    else:
+        failure = value not in options
+    if failure:
         raise ValueError(
-            f"`{param}` must be one of {options}, but {repr(value)} was passed."
+            f"The value for `{param}` must be one of {options}, "
+            f"but {repr(value)} was passed."
         )
+    return value
 
 
 def _assign_default_kwargs(kws, call_func, source_func):
@@ -832,7 +849,7 @@ def _deprecate_ci(errorbar, ci):
     (and extracted from kwargs) after one cycle.
 
     """
-    if ci != "deprecated":
+    if ci is not deprecated and ci != "deprecated":
         if ci is None:
             errorbar = None
         elif ci == "sd":
@@ -846,6 +863,13 @@ def _deprecate_ci(errorbar, ci):
         warnings.warn(msg, FutureWarning, stacklevel=3)
 
     return errorbar
+
+
+def _get_transform_functions(ax, axis):
+    """Return the forward and inverse transforms for a given axis."""
+    axis_obj = getattr(ax, f"{axis}axis")
+    transform = axis_obj.get_transform()
+    return transform.transform, transform.inverted().transform
 
 
 @contextmanager
@@ -865,3 +889,8 @@ def _disable_autolayout():
         yield
     finally:
         mpl.rcParams["figure.autolayout"] = orig_val
+
+
+def _version_predates(lib: ModuleType, version: str) -> bool:
+    """Helper function for checking version compatibility."""
+    return Version(lib.__version__) < Version(version)

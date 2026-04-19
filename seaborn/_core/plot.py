@@ -4,50 +4,55 @@ from __future__ import annotations
 import io
 import os
 import re
-import sys
 import inspect
 import itertools
 import textwrap
 from contextlib import contextmanager
 from collections import abc
 from collections.abc import Callable, Generator
-from typing import Any, List, Optional, cast
+from typing import Any, List, Literal, Optional, cast
+from xml.etree import ElementTree
 
 from cycler import cycler
 import pandas as pd
-from pandas import DataFrame, Series
+from pandas import DataFrame, Series, Index
 import matplotlib as mpl
 from matplotlib.axes import Axes
 from matplotlib.artist import Artist
 from matplotlib.figure import Figure
+from PIL import Image
 
 from seaborn._marks.base import Mark
 from seaborn._stats.base import Stat
 from seaborn._core.data import PlotData
 from seaborn._core.moves import Move
-from seaborn._core.scales import Scale
+from seaborn._core.scales import Scale, Nominal
 from seaborn._core.subplots import Subplots
 from seaborn._core.groupby import GroupBy
 from seaborn._core.properties import PROPERTIES, Property
-from seaborn._core.typing import DataSource, VariableSpec, VariableSpecList, OrderSpec
+from seaborn._core.typing import (
+    DataSource,
+    VariableSpec,
+    VariableSpecList,
+    OrderSpec,
+    Default,
+)
+from seaborn._core.exceptions import PlotSpecError
 from seaborn._core.rules import categorical_order
 from seaborn._compat import set_scale_obj, set_layout_engine
 from seaborn.rcmod import axes_style, plotting_context
 from seaborn.palettes import color_palette
-from seaborn.external.version import Version
+from seaborn.utils import _version_predates
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypedDict
 if TYPE_CHECKING:
     from matplotlib.figure import SubFigure
 
 
-if sys.version_info >= (3, 8):
-    from typing import TypedDict
-else:
-    from typing_extensions import TypedDict
+default = Default()
 
 
-# ---- Definitions for internal specs --------------------------------- #
+# ---- Definitions for internal specs ---------------------------------------------- #
 
 
 class Layer(TypedDict, total=False):
@@ -77,14 +82,7 @@ class PairSpec(TypedDict, total=False):
     wrap: int | None
 
 
-# --- Local helpers ----------------------------------------------------------------
-
-class Default:
-    def __repr__(self):
-        return "<default>"
-
-
-default = Default()
+# --- Local helpers ---------------------------------------------------------------- #
 
 
 @contextmanager
@@ -99,13 +97,11 @@ def theme_context(params: dict[str, Any]) -> Generator:
         mpl.rcParams.update(params)
         for (code, color) in zip(color_codes, nice_colors):
             mpl.colors.colorConverter.colors[code] = color
-            mpl.colors.colorConverter.cache[code] = color
         yield
     finally:
         mpl.rcParams.update(orig_params)
         for (code, color) in zip(color_codes, orig_colors):
             mpl.colors.colorConverter.colors[code] = color
-            mpl.colors.colorConverter.cache[code] = color
 
 
 def build_plot_signature(cls):
@@ -140,7 +136,115 @@ def build_plot_signature(cls):
     return cls
 
 
-# ---- The main interface for declarative plotting -------------------- #
+# ---- Plot configuration ---------------------------------------------------------- #
+
+
+class ThemeConfig(mpl.RcParams):
+    """
+    Configuration object for the Plot.theme, using matplotlib rc parameters.
+    """
+    THEME_GROUPS = [
+        "axes", "figure", "font", "grid", "hatch", "legend", "lines",
+        "mathtext", "markers", "patch", "savefig", "scatter",
+        "xaxis", "xtick", "yaxis", "ytick",
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.reset()
+
+    @property
+    def _default(self) -> dict[str, Any]:
+
+        return {
+            **self._filter_params(mpl.rcParamsDefault),
+            **axes_style("darkgrid"),
+            **plotting_context("notebook"),
+            "axes.prop_cycle": cycler("color", color_palette("deep")),
+        }
+
+    def reset(self) -> None:
+        """Update the theme dictionary with seaborn's default values."""
+        self.update(self._default)
+
+    def update(self, other: dict[str, Any] | None = None, /, **kwds):
+        """Update the theme with a dictionary or keyword arguments of rc parameters."""
+        if other is not None:
+            theme = self._filter_params(other)
+        else:
+            theme = {}
+        theme.update(kwds)
+        super().update(theme)
+
+    def _filter_params(self, params: dict[str, Any]) -> dict[str, Any]:
+        """Restruct to thematic rc params."""
+        return {
+            k: v for k, v in params.items()
+            if any(k.startswith(p) for p in self.THEME_GROUPS)
+        }
+
+    def _html_table(self, params: dict[str, Any]) -> list[str]:
+
+        lines = ["<table>"]
+        for k, v in params.items():
+            row = f"<tr><td>{k}:</td><td style='text-align:left'>{v!r}</td></tr>"
+            lines.append(row)
+        lines.append("</table>")
+        return lines
+
+    def _repr_html_(self) -> str:
+
+        repr = [
+            "<div style='height: 300px'>",
+            "<div style='border-style: inset; border-width: 2px'>",
+            *self._html_table(self),
+            "</div>",
+            "</div>",
+        ]
+        return "\n".join(repr)
+
+
+class DisplayConfig(TypedDict):
+    """Configuration for IPython's rich display hooks."""
+    format: Literal["png", "svg"]
+    scaling: float
+    hidpi: bool
+
+
+class PlotConfig:
+    """Configuration for default behavior / appearance of class:`Plot` instances."""
+    def __init__(self):
+
+        self._theme = ThemeConfig()
+        self._display = {"format": "png", "scaling": .85, "hidpi": True}
+
+    @property
+    def theme(self) -> dict[str, Any]:
+        """
+        Dictionary of base theme parameters for :class:`Plot`.
+
+        Keys and values correspond to matplotlib rc params, as documented here:
+        https://matplotlib.org/stable/tutorials/introductory/customizing.html
+
+        """
+        return self._theme
+
+    @property
+    def display(self) -> DisplayConfig:
+        """
+        Dictionary of parameters for rich display in Jupyter notebook.
+
+        Valid parameters:
+
+        - format ("png" or "svg"): Image format to produce
+        - scaling (float): Relative scaling of embedded image
+        - hidpi (bool): When True, double the DPI while preserving the size
+
+        """
+        return self._display
+
+
+# ---- The main interface for declarative plotting --------------------------------- #
 
 
 @build_plot_signature
@@ -178,6 +282,8 @@ class Plot:
     the plot without rendering it to access the lower-level representation.
 
     """
+    config = PlotConfig()
+
     _data: PlotData
     _layers: list[Layer]
 
@@ -258,7 +364,8 @@ class Plot:
                 if name in variables:
                     raise TypeError(f"`{name}` given by both name and position.")
                 # Keep coordinates at the front of the variables dict
-                variables = {name: var, **variables}
+                # Cast type because we know this isn't a DataSource at this point
+                variables = {name: cast(VariableSpec, var), **variables}
 
         return data, variables
 
@@ -270,11 +377,17 @@ class Plot:
         other_type = other.__class__.__name__
         raise TypeError(f"Unsupported operand type(s) for +: 'Plot' and '{other_type}")
 
-    def _repr_png_(self) -> tuple[bytes, dict[str, float]]:
+    def _repr_png_(self) -> tuple[bytes, dict[str, float]] | None:
 
+        if Plot.config.display["format"] != "png":
+            return None
         return self.plot()._repr_png_()
 
-    # TODO _repr_svg_?
+    def _repr_svg_(self) -> str | None:
+
+        if Plot.config.display["format"] != "svg":
+            return None
+        return self.plot()._repr_svg_()
 
     def _clone(self) -> Plot:
         """Generate a new object with the same information as the current spec."""
@@ -304,21 +417,7 @@ class Plot:
 
     def _theme_with_defaults(self) -> dict[str, Any]:
 
-        style_groups = [
-            "axes", "figure", "font", "grid", "hatch", "legend", "lines",
-            "mathtext", "markers", "patch", "savefig", "scatter",
-            "xaxis", "xtick", "yaxis", "ytick",
-        ]
-        base = {
-            k: mpl.rcParamsDefault[k] for k in mpl.rcParams
-            if any(k.startswith(p) for p in style_groups)
-        }
-        theme = {
-            **base,
-            **axes_style("darkgrid"),
-            **plotting_context("notebook"),
-            "axes.prop_cycle": cycler("color", color_palette("deep")),
-        }
+        theme = self.config.theme.copy()
         theme.update(self._theme)
         return theme
 
@@ -331,8 +430,11 @@ class Plot:
             + list(self._facet_spec.get("variables", []))
         )
         for layer in self._layers:
-            variables.extend(c for c in layer["vars"] if c not in variables)
-        return variables
+            variables.extend(v for v in layer["vars"] if v not in variables)
+
+        # Coerce to str in return to appease mypy; we know these will only
+        # ever be strings but I don't think we can type a DataFrame that way yet
+        return [str(v) for v in variables]
 
     def on(self, target: Axes | SubFigure | Figure) -> Plot:
         """
@@ -558,7 +660,7 @@ class Plot:
         .. include:: ../docstrings/objects.Plot.facet.rst
 
         """
-        variables = {}
+        variables: dict[str, VariableSpec] = {}
         if col is not None:
             variables["col"] = col
         if row is not None:
@@ -610,8 +712,8 @@ class Plot:
             - A list of values, implying a :class:`Nominal` scale (e.g. `["b", "r"]`)
 
         For more explicit control, pass a scale spec object such as :class:`Continuous`
-        or :class:`Nominal`. Or use `None` to use an "identity" scale, which treats data
-        values as literally encoding visual properties.
+        or :class:`Nominal`. Or pass `None` to use an "identity" scale, which treats
+        data values as literally encoding visual properties.
 
         Examples
         --------
@@ -737,7 +839,7 @@ class Plot:
 
     def theme(self, *args: dict[str, Any]) -> Plot:
         """
-        Control the default appearance of elements in the plot.
+        Control the appearance of elements in the plot.
 
         .. note::
 
@@ -763,7 +865,7 @@ class Plot:
             err = f"theme() takes 1 positional argument, but {nargs} were given"
             raise TypeError(err)
 
-        rc = args[0]
+        rc = mpl.RcParams(args[0])
         new._theme.update(rc)
 
         return new
@@ -900,13 +1002,7 @@ class Plotter:
     # TODO API for accessing the underlying matplotlib objects
     # TODO what else is useful in the public API for this class?
 
-    def _repr_png_(self) -> tuple[bytes, dict[str, float]]:
-
-        # TODO better to do this through a Jupyter hook? e.g.
-        # ipy = IPython.core.formatters.get_ipython()
-        # fmt = ipy.display_formatter.formatters["text/html"]
-        # fmt.for_type(Plot, ...)
-        # Would like to have a svg option too, not sure how to make that flexible
+    def _repr_png_(self) -> tuple[bytes, dict[str, float]] | None:
 
         # TODO use matplotlib backend directly instead of going through savefig?
 
@@ -918,26 +1014,43 @@ class Plotter:
         # Better solution would be to default (with option to change)
         # to using constrained/tight layout.
 
-        # TODO need to decide what the right default behavior here is:
-        # - Use dpi=72 to match default InlineBackend figure size?
-        # - Accept a generic "scaling" somewhere and scale DPI from that,
-        #   either with 1x -> 72 or 1x -> 96 and the default scaling be .75?
-        # - Listen to rcParams? InlineBackend behavior makes that so complicated :(
-        # - Do we ever want to *not* use retina mode at this point?
+        if Plot.config.display["format"] != "png":
+            return None
 
-        from PIL import Image
-
-        dpi = 96
         buffer = io.BytesIO()
 
-        with theme_context(self._theme):
-            self._figure.savefig(buffer, dpi=dpi * 2, format="png", bbox_inches="tight")
+        factor = 2 if Plot.config.display["hidpi"] else 1
+        scaling = Plot.config.display["scaling"] / factor
+        dpi = 96 * factor  # TODO put dpi in Plot.config?
+
+        with theme_context(self._theme):  # TODO _theme_with_defaults?
+            self._figure.savefig(buffer, dpi=dpi, format="png", bbox_inches="tight")
         data = buffer.getvalue()
 
-        scaling = .85 / 2
         w, h = Image.open(buffer).size
         metadata = {"width": w * scaling, "height": h * scaling}
         return data, metadata
+
+    def _repr_svg_(self) -> str | None:
+
+        if Plot.config.display["format"] != "svg":
+            return None
+
+        # TODO DPI for rasterized artists?
+
+        scaling = Plot.config.display["scaling"]
+
+        buffer = io.StringIO()
+        with theme_context(self._theme):  # TODO _theme_with_defaults?
+            self._figure.savefig(buffer, format="svg", bbox_inches="tight")
+
+        root = ElementTree.fromstring(buffer.getvalue())
+        w = scaling * float(root.attrib["width"][:-2])
+        h = scaling * float(root.attrib["height"][:-2])
+        root.attrib.update(width=f"{w}pt", height=f"{h}pt", viewbox=f"0 0 {w} {h}")
+        ElementTree.ElementTree(root).write(out := io.BytesIO())
+
+        return out.getvalue().decode()
 
     def _extract_data(self, p: Plot) -> tuple[PlotData, list[Layer]]:
 
@@ -1106,7 +1219,7 @@ class Plotter:
                 for axis, var in zip(*pairings):
                     if axis != var:
                         df = df.rename(columns={var: axis})
-                        drop_cols = [x for x in df if re.match(rf"{axis}\d+", x)]
+                        drop_cols = [x for x in df if re.match(rf"{axis}\d+", str(x))]
                         df = df.drop(drop_cols, axis=1)
                         scales[axis] = scales[var]
 
@@ -1176,7 +1289,7 @@ class Plotter:
             for layer in layers:
                 variables.extend(layer["data"].frame.columns)
                 for df in layer["data"].frames.values():
-                    variables.extend(v for v in df if v not in variables)
+                    variables.extend(str(v) for v in df if v not in variables)
             variables = [v for v in variables if v not in self._scales]
 
         for var in variables:
@@ -1231,8 +1344,7 @@ class Plotter:
             # https://github.com/matplotlib/matplotlib/pull/18308
             # This only affects us when sharing *paired* axes. This is a novel/niche
             # behavior, so we will raise rather than hack together a workaround.
-            if axis is not None and Version(mpl.__version__) < Version("3.4.0"):
-                from seaborn._core.scales import Nominal
+            if axis is not None and _version_predates(mpl, "3.4"):
                 paired_axis = axis in p._pair_spec.get("structure", {})
                 cat_scale = isinstance(scale, Nominal)
                 ok_dim = {"x": "col", "y": "row"}[axis]
@@ -1244,14 +1356,13 @@ class Plotter:
             if scale is None:
                 self._scales[var] = Scale._identity()
             else:
-                self._scales[var] = scale._setup(var_df[var], prop)
+                try:
+                    self._scales[var] = scale._setup(var_df[var], prop)
+                except Exception as err:
+                    raise PlotSpecError._during("Scale setup", var) from err
 
-            # Everything below here applies only to coordinate variables
-            # We additionally skip it when we're working with a value
-            # that is derived from a coordinate we've already processed.
-            # e.g., the Stat consumed y and added ymin/ymax. In that case,
-            # we've already setup the y scale and ymin/max are in scale space.
             if axis is None or (var != coord and coord in p._variables):
+                # Everything below here applies only to coordinate variables
                 continue
 
             # Set up an empty series to receive the transformed values.
@@ -1271,15 +1382,21 @@ class Plotter:
 
                 for layer, new_series in zip(layers, transformed_data):
                     layer_df = layer["data"].frame
-                    if var in layer_df:
-                        idx = self._get_subplot_index(layer_df, view)
-                        new_series.loc[idx] = view_scale(layer_df.loc[idx, var])
+                    if var not in layer_df:
+                        continue
 
-            # Now the transformed data series are complete, set update the layer data
+                    idx = self._get_subplot_index(layer_df, view)
+                    try:
+                        new_series.loc[idx] = view_scale(layer_df.loc[idx, var])
+                    except Exception as err:
+                        spec_error = PlotSpecError._during("Scaling operation", var)
+                        raise spec_error from err
+
+            # Now the transformed data series are complete, update the layer data
             for layer, new_series in zip(layers, transformed_data):
                 layer_df = layer["data"].frame
                 if var in layer_df:
-                    layer_df[var] = new_series
+                    layer_df[var] = pd.to_numeric(new_series)
 
     def _plot_layer(self, p: Plot, layer: Layer) -> None:
 
@@ -1304,12 +1421,22 @@ class Plotter:
                 if var not in "xy" and var in scales:
                     return getattr(scales[var], "order", None)
 
-            if "width" in mark._mappable_props:
-                width = mark._resolve(df, "width", None)
-            else:
-                width = df.get("width", 0.8)  # TODO what default
             if orient in df:
-                df["width"] = width * scales[orient]._spacing(df[orient])
+                width = pd.Series(index=df.index, dtype=float)
+                for view in subplots:
+                    view_idx = self._get_subplot_data(
+                        df, orient, view, p._shares.get(orient)
+                    ).index
+                    view_df = df.loc[view_idx]
+                    if "width" in mark._mappable_props:
+                        view_width = mark._resolve(view_df, "width", None)
+                    elif "width" in df:
+                        view_width = view_df["width"]
+                    else:
+                        view_width = 0.8  # TODO what default?
+                    spacing = scales[orient]._spacing(view_df.loc[view_idx, orient])
+                    width.loc[view_idx] = view_width * spacing
+                df["width"] = width
 
             if "baseline" in mark._mappable_props:
                 # TODO what marks should have this?
@@ -1321,7 +1448,7 @@ class Plotter:
                 # TODO unlike width, we might not want to add baseline to data
                 # if the mark doesn't use it. Practically, there is a concern about
                 # Mark abstraction like Area / Ribbon
-                baseline = df.get("baseline", 0)
+                baseline = 0 if "baseline" not in df else df["baseline"]
             df["baseline"] = baseline
 
             if move is not None:
@@ -1351,37 +1478,14 @@ class Plotter:
         if layer["legend"]:
             self._update_legend_contents(p, mark, data, scales)
 
-    def _scale_coords(self, subplots: list[dict], df: DataFrame) -> DataFrame:
-        # TODO stricter type on subplots
-
-        coord_cols = [c for c in df if re.match(r"^[xy]\D*$", c)]
-        out_df = (
-            df
-            .copy(deep=False)
-            .drop(coord_cols, axis=1)
-            .reindex(df.columns, axis=1)  # So unscaled columns retain their place
-        )
-
-        for view in subplots:
-            view_df = self._filter_subplot_data(df, view)
-            axes_df = view_df[coord_cols]
-            with pd.option_context("mode.use_inf_as_null", True):
-                axes_df = axes_df.dropna()
-            for var, values in axes_df.items():
-                scale = view[f"{var[0]}scale"]
-                out_df.loc[values.index, var] = scale(values)
-
-        return out_df
-
     def _unscale_coords(
         self, subplots: list[dict], df: DataFrame, orient: str,
     ) -> DataFrame:
         # TODO do we still have numbers in the variable name at this point?
-        coord_cols = [c for c in df if re.match(r"^[xy]\D*$", c)]
-        drop_cols = [*coord_cols, "width"] if "width" in df else coord_cols
+        coord_cols = [c for c in df if re.match(r"^[xy]\D*$", str(c))]
         out_df = (
             df
-            .drop(drop_cols, axis=1)
+            .drop(coord_cols, axis=1)
             .reindex(df.columns, axis=1)  # So unscaled columns retain their place
             .copy(deep=False)
         )
@@ -1391,17 +1495,11 @@ class Plotter:
             axes_df = view_df[coord_cols]
             for var, values in axes_df.items():
 
-                axis = getattr(view["ax"], f"{var[0]}axis")
+                axis = getattr(view["ax"], f"{str(var)[0]}axis")
                 # TODO see https://github.com/matplotlib/matplotlib/issues/22713
                 transform = axis.get_transform().inverted().transform
                 inverted = transform(values)
-                out_df.loc[values.index, var] = inverted
-
-                if var == orient and "width" in view_df:
-                    width = view_df["width"]
-                    out_df.loc[values.index, "width"] = (
-                        transform(values + width / 2) - transform(values - width / 2)
-                    )
+                out_df.loc[values.index, str(var)] = inverted
 
         return out_df
 
@@ -1442,12 +1540,12 @@ class Plotter:
             for axis, var in zip("xy", (x, y)):
                 if axis != var:
                     out_df = out_df.rename(columns={var: axis})
-                    cols = [col for col in out_df if re.match(rf"{axis}\d+", col)]
+                    cols = [col for col in out_df if re.match(rf"{axis}\d+", str(col))]
                     out_df = out_df.drop(cols, axis=1)
 
             yield subplots, out_df, scales
 
-    def _get_subplot_index(self, df: DataFrame, subplot: dict) -> DataFrame:
+    def _get_subplot_index(self, df: DataFrame, subplot: dict) -> Index:
 
         dims = df.columns.intersection(["col", "row"])
         if dims.empty:
@@ -1473,8 +1571,6 @@ class Plotter:
         self, grouping_vars: list[str], df: DataFrame, subplots: list[dict[str, Any]],
     ) -> Callable[[], Generator]:
 
-        allow_empty = False  # TODO will need to recreate previous categorical plots
-
         grouping_keys = []
         grouping_vars = [
             v for v in grouping_vars if v in df and v not in ["col", "row"]
@@ -1491,7 +1587,7 @@ class Plotter:
 
                 axes_df = self._filter_subplot_data(df, view)
 
-                with pd.option_context("mode.use_inf_as_null", True):
+                with pd.option_context("mode.use_inf_as_na", True):
                     if keep_na:
                         # The simpler thing to do would be x.dropna().reindex(x.index).
                         # But that doesn't work with the way that the subset iteration
@@ -1513,7 +1609,8 @@ class Plotter:
                         subplot_keys[dim] = view[dim]
 
                 if not grouping_vars or not any(grouping_keys):
-                    yield subplot_keys, axes_df.copy(), view["ax"]
+                    if not axes_df.empty:
+                        yield subplot_keys, axes_df.copy(), view["ax"]
                     continue
 
                 grouped_df = axes_df.groupby(grouping_vars, sort=False, as_index=False)
@@ -1533,7 +1630,7 @@ class Plotter:
                         # case this option could be removed
                         df_subset = axes_df.loc[[]]
 
-                    if df_subset.empty and not allow_empty:
+                    if df_subset.empty:
                         continue
 
                     sub_vars = dict(zip(grouping_vars, key))
@@ -1553,11 +1650,12 @@ class Plotter:
     ) -> None:
         """Add legend artists / labels for one layer in the plot."""
         if data.frame.empty and data.frames:
-            legend_vars = set()
+            legend_vars: list[str] = []
             for frame in data.frames.values():
-                legend_vars.update(frame.columns.intersection(scales))
+                frame_vars = frame.columns.intersection(list(scales))
+                legend_vars.extend(v for v in frame_vars if v not in legend_vars)
         else:
-            legend_vars = data.frame.columns.intersection(scales)
+            legend_vars = list(data.frame.columns.intersection(list(scales)))
 
         # First pass: Identify the values that will be shown for each variable
         schema: list[tuple[
@@ -1579,12 +1677,15 @@ class Plotter:
                     schema.append(entry)
 
         # Second pass, generate an artist corresponding to each value
-        contents = []
+        contents: list[tuple[tuple[str, str | int], Any, list[str]]] = []
         for key, variables, (values, labels) in schema:
             artists = []
             for val in values:
-                artists.append(mark._legend_artist(variables, val, scales))
-            contents.append((key, artists, labels))
+                artist = mark._legend_artist(variables, val, scales)
+                if artist is not None:
+                    artists.append(artist)
+            if artists:
+                contents.append((key, artists, labels))
 
         self._legend_contents.extend(contents)
 
@@ -1596,7 +1697,7 @@ class Plotter:
         merged_contents: dict[
             tuple[str, str | int], tuple[list[Artist], list[str]],
         ] = {}
-        for key, artists, labels in self._legend_contents:
+        for key, new_artists, labels in self._legend_contents:
             # Key is (name, id); we need the id to resolve variable uniqueness,
             # but will need the name in the next step to title the legend
             if key in merged_contents:
@@ -1605,11 +1706,11 @@ class Plotter:
                 for i, artist in enumerate(existing_artists):
                     # Matplotlib accepts a tuple of artists and will overlay them
                     if isinstance(artist, tuple):
-                        artist += artist[i],
+                        artist += new_artists[i],
                     else:
-                        existing_artists[i] = artist, artists[i]
+                        existing_artists[i] = artist, new_artists[i]
             else:
-                merged_contents[key] = artists.copy(), labels
+                merged_contents[key] = new_artists.copy(), labels
 
         # TODO explain
         loc = "center right" if self._pyplot else "center left"
@@ -1643,6 +1744,7 @@ class Plotter:
             ax = sub["ax"]
             for axis in "xy":
                 axis_key = sub[axis]
+                axis_obj = getattr(ax, f"{axis}axis")
 
                 # Axis limits
                 if axis_key in p._limits:
@@ -1656,6 +1758,15 @@ class Plotter:
                         hi = cast(float, hi) + 0.5
                     ax.set(**{f"{axis}lim": (lo, hi)})
 
-        engine_default = None if p._target is not None else "tight"
-        layout_engine = p._layout_spec.get("engine", engine_default)
-        set_layout_engine(self._figure, layout_engine)
+                if axis_key in self._scales:  # TODO when would it not be?
+                    self._scales[axis_key]._finalize(p, axis_obj)
+
+        if (engine := p._layout_spec.get("engine", default)) is not default:
+            # None is a valid arg for Figure.set_layout_engine, hence `default`
+            set_layout_engine(self._figure, engine)
+        elif p._target is None:
+            # Don't modify the layout engine if the user supplied their own
+            # matplotlib figure and didn't specify an engine through Plot
+            # TODO switch default to "constrained"?
+            # TODO either way, make configurable
+            set_layout_engine(self._figure, "tight")

@@ -20,6 +20,7 @@ from seaborn._core.properties import (
     DashPattern,
     DashPatternWithOffset,
 )
+from seaborn._core.exceptions import PlotSpecError
 
 
 class Mappable:
@@ -172,7 +173,13 @@ class Mark:
                 # TODO Might this obviate the identity scale? Just don't add a scale?
                 feature = data[name]
             else:
-                feature = scales[name](data[name])
+                scale = scales[name]
+                value = data[name]
+                try:
+                    feature = scale(value)
+                except Exception as err:
+                    raise PlotSpecError._during("Scaling operation", name) from err
+
             if return_array:
                 feature = np.asarray(feature)
             return feature
@@ -217,8 +224,8 @@ class Mark:
     def _legend_artist(
         self, variables: list[str], value: Any, scales: dict[str, Scale],
     ) -> Artist:
-        # TODO return some sensible default?
-        raise NotImplementedError
+
+        return None
 
 
 def resolve_properties(

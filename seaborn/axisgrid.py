@@ -10,7 +10,7 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 
 from ._oldcore import VectorPlotter, variable_type, categorical_order
-from ._compat import share_axis
+from ._compat import share_axis, get_legend_handles
 from . import utils
 from .utils import (
     adjust_legend_subtitles, _check_argument, _draw_figure, _disable_autolayout
@@ -229,7 +229,7 @@ class Grid(_BaseGrid):
         # Get data directly from the legend, which is necessary
         # for newer functions that don't add labeled proxy artists
         if ax.legend_ is not None and self._extract_legend_handles:
-            handles = ax.legend_.legendHandles
+            handles = get_legend_handles(ax.legend_)
             labels = [t.get_text() for t in ax.legend_.texts]
             data.update({l: h for h, l in zip(handles, labels)})
 
@@ -742,7 +742,7 @@ class FacetGrid(Grid):
             plot_data = data_ijk[list(args)]
             if self._dropna:
                 plot_data = plot_data.dropna()
-            plot_args = [v for k, v in plot_data.iteritems()]
+            plot_args = [v for k, v in plot_data.items()]
 
             # Some matplotlib functions don't handle pandas objects correctly
             if func_module.startswith("matplotlib"):
@@ -949,7 +949,7 @@ class FacetGrid(Grid):
             Template for the row variable when titles are drawn on the grid
             margins. Must have {row_var} and {row_name} formatting keys.
         col_template:
-            Template for the row variable when titles are drawn on the grid
+            Template for the column variable when titles are drawn on the grid
             margins. Must have {col_var} and {col_name} formatting keys.
 
         Returns
@@ -2352,7 +2352,6 @@ Parameters
 {params.core.data}
 {params.core.xy}
 {params.core.hue}
-    Semantic variable that is mapped to determine the color of plot elements.
 kind : {{ "scatter" | "kde" | "hist" | "hex" | "reg" | "resid" }}
     Kind of plot to draw. See the examples for references to the underlying functions.
 height : numeric

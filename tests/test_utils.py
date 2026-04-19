@@ -1,6 +1,7 @@
 """Tests for seaborn utility functions."""
 import re
 import tempfile
+from types import ModuleType
 from urllib.request import urlopen
 from http.client import HTTPException
 
@@ -20,16 +21,18 @@ from pandas.testing import (
 )
 
 from seaborn import utils, rcmod
-from seaborn.external.version import Version
 from seaborn.utils import (
     get_dataset_names,
     get_color_cycle,
     remove_na,
     load_dataset,
     _assign_default_kwargs,
+    _check_argument,
     _draw_figure,
     _deprecate_ci,
+    _version_predates, DATASET_NAMES_URL,
 )
+from seaborn._compat import get_legend_handles
 
 
 a_norm = np.random.randn(100)
@@ -87,6 +90,9 @@ def test_desaturate():
 
     out4 = utils.desaturate("red", .5)
     assert out4 == (.75, .25, .25)
+
+    out5 = utils.desaturate("lightblue", 1)
+    assert out5 == mpl.colors.to_rgb("lightblue")
 
 
 def test_desaturation_prop():
@@ -325,8 +331,7 @@ def test_locator_to_legend_entries():
     locator = mpl.ticker.LogLocator(numticks=5)
     limits = (5, 1425)
     levels, str_levels = utils.locator_to_legend_entries(locator, limits, int)
-    if Version(mpl.__version__) >= Version("3.1"):
-        assert str_levels == ['10', '100', '1000']
+    assert str_levels == ['10', '100', '1000']
 
     limits = (0.00003, 0.02)
     _, str_levels = utils.locator_to_legend_entries(locator, limits, float)
@@ -407,8 +412,8 @@ def test_move_legend_grid_object(long_df):
     assert g.legend.get_title().get_text() == hue_var
     assert g.legend.get_title().get_size() == fontsize
 
-    assert g.legend.legendHandles
-    for i, h in enumerate(g.legend.legendHandles):
+    assert get_legend_handles(g.legend)
+    for i, h in enumerate(get_legend_handles(g.legend)):
         assert mpl.colors.to_rgb(h.get_color()) == mpl.colors.to_rgb(f"C{i}")
 
 
@@ -427,7 +432,7 @@ def test_move_legend_input_checks():
 
 def check_load_dataset(name):
     ds = load_dataset(name, cache=False)
-    assert(isinstance(ds, pd.DataFrame))
+    assert isinstance(ds, pd.DataFrame)
 
 
 def check_load_cached_dataset(name):
@@ -441,14 +446,14 @@ def check_load_cached_dataset(name):
         assert_frame_equal(ds, ds2)
 
 
-@_network(url="https://github.com/mwaskom/seaborn-data")
+@_network(url=DATASET_NAMES_URL)
 def test_get_dataset_names():
     names = get_dataset_names()
     assert names
     assert "tips" in names
 
 
-@_network(url="https://github.com/mwaskom/seaborn-data")
+@_network(url=DATASET_NAMES_URL)
 def test_load_datasets():
 
     # Heavy test to verify that we can load all available datasets
@@ -459,7 +464,7 @@ def test_load_datasets():
         check_load_dataset(name)
 
 
-@_network(url="https://github.com/mwaskom/seaborn-data")
+@_network(url=DATASET_NAMES_URL)
 def test_load_dataset_string_error():
 
     name = "bad_name"
@@ -548,6 +553,23 @@ def test_assign_default_kwargs():
     assert kws == {"c": 3, "d": 2}
 
 
+def test_check_argument():
+
+    opts = ["a", "b", None]
+    assert _check_argument("arg", opts, "a") == "a"
+    assert _check_argument("arg", opts, None) is None
+    assert _check_argument("arg", opts, "aa", prefix=True) == "aa"
+    assert _check_argument("arg", opts, None, prefix=True) is None
+    with pytest.raises(ValueError, match="The value for `arg`"):
+        _check_argument("arg", opts, "c")
+    with pytest.raises(ValueError, match="The value for `arg`"):
+        _check_argument("arg", opts, "c", prefix=True)
+    with pytest.raises(ValueError, match="The value for `arg`"):
+        _check_argument("arg", opts[:-1], None)
+    with pytest.raises(ValueError, match="The value for `arg`"):
+        _check_argument("arg", opts[:-1], None, prefix=True)
+
+
 def test_draw_figure():
 
     f, ax = plt.subplots()
@@ -573,3 +595,16 @@ def test_deprecate_ci():
     with pytest.warns(FutureWarning, match=msg + r"\('ci', 68\)"):
         out = _deprecate_ci(None, 68)
     assert out == ("ci", 68)
+
+
+def test_version_predates():
+
+    mock = ModuleType("mock")
+    mock.__version__ = "1.2.3"
+
+    assert _version_predates(mock, "1.2.4")
+    assert _version_predates(mock, "1.3")
+
+    assert not _version_predates(mock, "1.2.3")
+    assert not _version_predates(mock, "0.8")
+    assert not _version_predates(mock, "1")

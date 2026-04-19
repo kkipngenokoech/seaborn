@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -5,10 +7,7 @@ import pandas as pd
 
 import pytest
 import numpy.testing as npt
-try:
-    import pandas.testing as pdt
-except ImportError:
-    import pandas.util.testing as pdt
+import pandas.testing as pdt
 
 try:
     import statsmodels.regression.linear_model as smlm
@@ -17,7 +16,7 @@ except ImportError:
     _no_statsmodels = True
 
 from seaborn import regression as lm
-from seaborn.external.version import Version
+from seaborn.utils import _version_predates
 from seaborn.palettes import color_palette
 
 rs = np.random.RandomState(0)
@@ -400,7 +399,8 @@ class TestRegressionPlotter:
         y = self.df.x > self.df.x.mean()
         p = lm._RegressionPlotter("x", y, data=self.df,
                                   logistic=True, n_boot=10)
-        with np.errstate(all="ignore"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
             _, yhat, _ = p.fit_regression(x_range=(-3, 3))
         assert np.isnan(yhat).all()
 
@@ -605,7 +605,7 @@ class TestRegressionPlots:
         npt.assert_array_equal(red, red_scatter.get_facecolors()[0, :3])
         npt.assert_array_equal(blue, blue_scatter.get_facecolors()[0, :3])
 
-    @pytest.mark.skipif(Version(mpl.__version__) < Version("3.4"),
+    @pytest.mark.skipif(_version_predates(mpl, "3.4"),
                         reason="MPL bug #15967")
     @pytest.mark.parametrize("sharex", [True, False])
     def test_lmplot_facet_truncate(self, sharex):

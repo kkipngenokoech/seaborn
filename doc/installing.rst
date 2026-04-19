@@ -19,7 +19,7 @@ and it can be installed with `conda`::
 
     conda install seaborn
 
-As the main Anaconda repository can be slow to add new releaes, you may prefer using the
+As the main Anaconda repository can be slow to add new releases, you may prefer using the
 `conda-forge <https://conda-forge.org/>`_ channel::
 
     conda install seaborn -c conda-forge
@@ -30,7 +30,7 @@ Dependencies
 Supported Python versions
 ^^^^^^^^^^^^^^^^^^^^^^^^^
 
-- Python 3.7+
+- Python 3.8+
 
 Mandatory dependencies
 ^^^^^^^^^^^^^^^^^^^^^^

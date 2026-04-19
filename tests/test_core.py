@@ -22,14 +22,8 @@ from seaborn._oldcore import (
     unique_markers,
     categorical_order,
 )
-
+from seaborn.utils import desaturate
 from seaborn.palettes import color_palette
-
-
-try:
-    from pandas import NA as PD_NA
-except ImportError:
-    PD_NA = None
 
 
 @pytest.fixture(params=[
@@ -324,6 +318,17 @@ class TestHueMapping:
         p = VectorPlotter(data=long_df, variables=dict(x="x", y="y"))
         with pytest.warns(UserWarning, match="Ignoring `palette`"):
             HueMapping(p, palette="viridis")
+
+    def test_saturation(self, long_df):
+
+        p = VectorPlotter(data=long_df, variables=dict(x="x", y="y", hue="a"))
+        levels = categorical_order(long_df["a"])
+        palette = color_palette("viridis", len(levels))
+        saturation = 0.8
+
+        m = HueMapping(p, palette=palette, saturation=saturation)
+        for i, color in enumerate(m(levels)):
+            assert mpl.colors.same_color(color, desaturate(palette[i], saturation))
 
 
 class TestSizeMapping:
@@ -980,10 +985,10 @@ class TestVectorPlotter:
         for i, (sub_vars, _) in enumerate(iterator):
             assert sub_vars["hue"] == reversed_order[i]
 
-    def test_iter_data_dropna(self, missing_df):
+    def test_iter_data_dropna(self, null_df):
 
         p = VectorPlotter(
-            data=missing_df,
+            data=null_df,
             variables=dict(x="x", y="y", hue="a")
         )
         for _, sub_df in p.iter_data("hue"):
@@ -1140,12 +1145,12 @@ class TestVectorPlotter:
         p = VectorPlotter(data=long_df, variables={"x": "x", "y": "t"})
         p._attach(ax)
         assert ax.xaxis.converter is None
-        assert isinstance(ax.yaxis.converter, mpl.dates.DateConverter)
+        assert "Date" in ax.yaxis.converter.__class__.__name__
 
         _, ax = plt.subplots()
         p = VectorPlotter(data=long_df, variables={"x": "a", "y": "y"})
         p._attach(ax)
-        assert isinstance(ax.xaxis.converter, mpl.category.StrCategoryConverter)
+        assert "CategoryConverter" in ax.xaxis.converter.__class__.__name__
         assert ax.yaxis.converter is None
 
     def test_attach_facets(self, long_df):
@@ -1290,13 +1295,11 @@ class TestVectorPlotter:
 
     @pytest.fixture(
         params=itertools.product(
-            [None, np.nan, PD_NA],
-            ["numeric", "category", "datetime"]
+            [None, np.nan, pd.NA],
+            ["numeric", "category", "datetime"],
         )
     )
-    @pytest.mark.parametrize(
-        "NA,var_type",
-    )
+    @pytest.mark.parametrize("NA,var_type")
     def comp_data_missing_fixture(self, request):
 
         # This fixture holds the logic for parameterizing
@@ -1304,14 +1307,11 @@ class TestVectorPlotter:
 
         NA, var_type = request.param
 
-        if NA is None:
-            pytest.skip("No pandas.NA available")
-
         comp_data = [0, 1, np.nan, 2, np.nan, 1]
         if var_type == "numeric":
             orig_data = [0, 1, NA, 2, np.inf, 1]
         elif var_type == "category":
-            orig_data = ["a", "b", NA, "c", NA, "b"]
+            orig_data = ["a", "b", NA, "c", pd.NA, "b"]
         elif var_type == "datetime":
             # Use 1-based numbers to avoid issue on matplotlib<3.2
             # Could simplify the test a bit when we roll off that version
@@ -1331,6 +1331,7 @@ class TestVectorPlotter:
         ax = plt.figure().subplots()
         p._attach(ax)
         assert_array_equal(p.comp_data["x"], comp_data)
+        assert p.comp_data["x"].dtype == "float"
 
     def test_comp_data_duplicate_index(self):
 
@@ -1339,6 +1340,15 @@ class TestVectorPlotter:
         ax = plt.figure().subplots()
         p._attach(ax)
         assert_array_equal(p.comp_data["x"], x)
+
+    def test_comp_data_nullable_dtype(self):
+
+        x = pd.Series([1, 2, 3, 4], dtype="Int64")
+        p = VectorPlotter(variables={"x": x})
+        ax = plt.figure().subplots()
+        p._attach(ax)
+        assert_array_equal(p.comp_data["x"], x)
+        assert p.comp_data["x"].dtype == "float"
 
     def test_var_order(self, long_df):
 
@@ -1444,7 +1454,12 @@ class TestCoreFunc:
         assert variable_type(s) == "numeric"
 
         s = pd.Series([np.nan, np.nan])
-        # s = pd.Series([pd.NA, pd.NA])
+        assert variable_type(s) == "numeric"
+
+        s = pd.Series([pd.NA, pd.NA])
+        assert variable_type(s) == "numeric"
+
+        s = pd.Series([1, 2, pd.NA], dtype="Int64")
         assert variable_type(s) == "numeric"
 
         s = pd.Series(["1", "2", "3"])
@@ -1471,39 +1486,39 @@ class TestCoreFunc:
         cats = pd.Series(["a", "b"] * 3)
         dates = pd.date_range("1999-09-22", "2006-05-14", 6)
 
-        assert infer_orient(cats, nums) == "v"
-        assert infer_orient(nums, cats) == "h"
+        assert infer_orient(cats, nums) == "x"
+        assert infer_orient(nums, cats) == "y"
 
-        assert infer_orient(cats, dates, require_numeric=False) == "v"
-        assert infer_orient(dates, cats, require_numeric=False) == "h"
+        assert infer_orient(cats, dates, require_numeric=False) == "x"
+        assert infer_orient(dates, cats, require_numeric=False) == "y"
 
-        assert infer_orient(nums, None) == "h"
+        assert infer_orient(nums, None) == "y"
         with pytest.warns(UserWarning, match="Vertical .+ `x`"):
-            assert infer_orient(nums, None, "v") == "h"
+            assert infer_orient(nums, None, "v") == "y"
 
-        assert infer_orient(None, nums) == "v"
+        assert infer_orient(None, nums) == "x"
         with pytest.warns(UserWarning, match="Horizontal .+ `y`"):
-            assert infer_orient(None, nums, "h") == "v"
+            assert infer_orient(None, nums, "h") == "x"
 
-        infer_orient(cats, None, require_numeric=False) == "h"
+        infer_orient(cats, None, require_numeric=False) == "y"
         with pytest.raises(TypeError, match="Horizontal .+ `x`"):
             infer_orient(cats, None)
 
-        infer_orient(cats, None, require_numeric=False) == "v"
+        infer_orient(cats, None, require_numeric=False) == "x"
         with pytest.raises(TypeError, match="Vertical .+ `y`"):
             infer_orient(None, cats)
 
-        assert infer_orient(nums, nums, "vert") == "v"
-        assert infer_orient(nums, nums, "hori") == "h"
+        assert infer_orient(nums, nums, "vert") == "x"
+        assert infer_orient(nums, nums, "hori") == "y"
 
-        assert infer_orient(cats, cats, "h", require_numeric=False) == "h"
-        assert infer_orient(cats, cats, "v", require_numeric=False) == "v"
-        assert infer_orient(cats, cats, require_numeric=False) == "v"
+        assert infer_orient(cats, cats, "h", require_numeric=False) == "y"
+        assert infer_orient(cats, cats, "v", require_numeric=False) == "x"
+        assert infer_orient(cats, cats, require_numeric=False) == "x"
 
         with pytest.raises(TypeError, match="Vertical .+ `y`"):
-            infer_orient(cats, cats, "v")
+            infer_orient(cats, cats, "x")
         with pytest.raises(TypeError, match="Horizontal .+ `x`"):
-            infer_orient(cats, cats, "h")
+            infer_orient(cats, cats, "y")
         with pytest.raises(TypeError, match="Neither"):
             infer_orient(cats, cats)
 

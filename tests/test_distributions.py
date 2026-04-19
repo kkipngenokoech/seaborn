@@ -31,7 +31,7 @@ from seaborn.distributions import (
     kdeplot,
     rugplot,
 )
-from seaborn.external.version import Version
+from seaborn.utils import _version_predates
 from seaborn.axisgrid import FacetGrid
 from seaborn._testing import (
     assert_plots_equal,
@@ -904,7 +904,7 @@ class TestKDEPlotUnivariate(SharedAxesLevelTests):
             assert label.get_text() == level
 
         legend_artists = ax.legend_.findobj(mpl.lines.Line2D)
-        if Version(mpl.__version__) < Version("3.5.0b0"):
+        if _version_predates(mpl, "3.5.0b0"):
             # https://github.com/matplotlib/matplotlib/pull/20699
             legend_artists = legend_artists[::2]
         palette = color_palette()
@@ -962,7 +962,7 @@ class TestKDEPlotBivariate:
             f, ax = plt.subplots()
             kdeplot(data=long_df, x="x", y="y", hue="c", fill=fill)
             for c in ax.collections:
-                if fill or Version(mpl.__version__) >= Version("3.5.0b0"):
+                if fill or not _version_predates(mpl, "3.5.0b0"):
                     assert isinstance(c, mpl.collections.PathCollection)
                 else:
                     assert isinstance(c, mpl.collections.LineCollection)
@@ -1059,6 +1059,15 @@ class TestKDEPlotBivariate:
 
         for c in ax.collections:
             assert_colors_equal(get_contour_color(c), color)
+
+    def test_contour_line_cmap(self, long_df):
+
+        color_list = color_palette("Blues", 12)
+        cmap = mpl.colors.ListedColormap(color_list)
+        ax = kdeplot(data=long_df, x="x", y="y", cmap=cmap)
+        for c in ax.collections:
+            color = to_rgb(get_contour_color(c).squeeze())
+            assert color in color_list
 
     def test_contour_fill_colors(self, long_df):
 
@@ -1421,15 +1430,15 @@ class TestHistPlotUnivariate(SharedAxesLevelTests):
             bars = bar_groups[i]
             start = bars[0].get_x()
             stop = bars[-1].get_x() + bars[-1].get_width()
-            assert start == wide_df[col].min()
-            assert stop == wide_df[col].max()
+            assert_array_almost_equal(start, wide_df[col].min())
+            assert_array_almost_equal(stop, wide_df[col].max())
 
-    def test_weights_with_missing(self, missing_df):
+    def test_weights_with_missing(self, null_df):
 
-        ax = histplot(missing_df, x="x", weights="s", bins=5)
+        ax = histplot(null_df, x="x", weights="s", bins=5)
 
         bar_heights = [bar.get_height() for bar in ax.patches]
-        total_weight = missing_df[["x", "s"]].dropna()["s"].sum()
+        total_weight = null_df[["x", "s"]].dropna()["s"].sum()
         assert sum(bar_heights) == pytest.approx(total_weight)
 
     def test_weight_norm(self, rng):
@@ -1471,10 +1480,6 @@ class TestHistPlotUnivariate(SharedAxesLevelTests):
         ymax, ymin = ax.get_ylim()
         assert ymax > ymin
 
-    @pytest.mark.skipif(
-        Version(np.__version__) < Version("1.17"),
-        reason="Histogram over datetime64 requires numpy >= 1.17",
-    )
     def test_datetime_scale(self, long_df):
 
         f, (ax1, ax2) = plt.subplots(2)
@@ -1559,14 +1564,14 @@ class TestHistPlotUnivariate(SharedAxesLevelTests):
 
     def test_kde_singular_data(self):
 
-        with pytest.warns(None) as record:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
             ax = histplot(x=np.ones(10), kde=True)
-        assert not record
         assert not ax.lines
 
-        with pytest.warns(None) as record:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
             ax = histplot(x=[5], kde=True)
-        assert not record
         assert not ax.lines
 
     def test_element_default(self, long_df):
@@ -1748,6 +1753,14 @@ class TestHistPlotUnivariate(SharedAxesLevelTests):
         x_max = np.log([b.get_x() + b.get_width() for b in ax.patches])
         assert np.unique(np.round(x_max - x_min, 10)).size == 1
 
+    def test_log_scale_kde(self, rng):
+
+        x = rng.lognormal(0, 1, 1000)
+        ax = histplot(x=x, log_scale=True, kde=True, bins=20)
+        bar_height = max(p.get_height() for p in ax.patches)
+        kde_height = max(ax.lines[0].get_ydata())
+        assert bar_height == pytest.approx(kde_height, rel=.1)
+
     @pytest.mark.parametrize(
         "fill", [True, False],
     )
@@ -1806,6 +1819,18 @@ class TestHistPlotUnivariate(SharedAxesLevelTests):
         line = ax.lines[0]
         assert line.get_linewidth() == lw
         assert line.get_linestyle() == ls
+
+    def test_label(self, flat_series):
+
+        ax = histplot(flat_series, label="a label")
+        handles, labels = ax.get_legend_handles_labels()
+        assert len(handles) == 1
+        assert labels == ["a label"]
+
+    def test_default_color_scout_cleanup(self, flat_series):
+
+        ax = histplot(flat_series)
+        assert len(ax.containers) == 1
 
 
 class TestHistPlotBivariate:
@@ -1910,8 +1935,8 @@ class TestHistPlotBivariate:
         edges = itertools.product(y_edges[:-1], x_edges[:-1])
         for i, (y_i, x_i) in enumerate(edges):
             path = mesh.get_paths()[i]
-            assert path.vertices[0, 0] == 10 ** x_i
-            assert path.vertices[0, 1] == 10 ** y_i
+            assert path.vertices[0, 0] == pytest.approx(10 ** x_i)
+            assert path.vertices[0, 1] == pytest.approx(10 ** y_i)
 
     def test_mesh_thresh(self, long_df):
 
